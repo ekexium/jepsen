@@ -43,15 +43,16 @@
             (catch java.sql.SQLIntegrityConstraintViolationException e nil))))))
 
   (invoke! [this test op]
-    (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
-      (try
-        (case (:f op)
-          :read (->> (c/query c [(str "select * from accounts")])
-                     (map (juxt :id :balance))
-                     (into (sorted-map))
-                     (assoc op :type :ok, :value))
-
-          :transfer
+    (try
+      (case (:f op)
+        :read
+        (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+          (->> (c/query c [(str "select * from accounts")])
+               (map (juxt :id :balance))
+               (into (sorted-map))
+               (assoc op :type :ok, :value)))
+        :transfer
+        (c/attach-txn-info conn (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
           (let [{:keys [from to amount]} (:value op)
                 b1 (-> c
                        (c/query [(str "select * from accounts where id = ? "
@@ -77,7 +78,7 @@
                         (assoc op :type :ok :value (transfer_value (txn_ts c) from to b1 b2 amount)))
                     (do (c/update! c :accounts {:balance b1} ["id = ?" from])
                         (c/update! c :accounts {:balance b2} ["id = ?" to])
-                        (assoc op :type :ok :value (transfer_value (txn_ts c) from to b1 b2 amount))))))))))
+                        (assoc op :type :ok :value (transfer_value (txn_ts c) from to b1 b2 amount)))))))))))
 
   (teardown! [_ test])
 
@@ -133,7 +134,7 @@
                 (assoc op :type :ok, :value)))
 
           :transfer
-          (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+          (c/attach-txn-info conn (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
             (let [{:keys [from to amount]} (:value op)
                   from (str "accounts" from)
                   to   (str "accounts" to)
@@ -161,7 +162,7 @@
                           (assoc op :type :ok :value (transfer_value (txn_ts c)  from to b1 b2 amount)))
                       (do (c/update! c from {:balance b1} ["id = 0"])
                           (c/update! c to {:balance b2} ["id = 0"])
-                          (assoc op :type :ok :value (transfer_value (txn_ts c)  from to b1 b2 amount))))))))))
+                          (assoc op :type :ok :value (transfer_value (txn_ts c)  from to b1 b2 amount)))))))))))
 
   (teardown! [_ test]
     (if (and (= "n1" (:tidb.sql/node conn)) (not= 100 (cal-sum-total @(:history test))))

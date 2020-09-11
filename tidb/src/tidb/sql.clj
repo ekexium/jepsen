@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [dom-top.core :as dt]
             [jepsen [util :as util :refer [default timeout]]]
+            [cheshire.core :as json]
             [clojure.java.jdbc :as j]
             [clojure.tools.logging :refer [info warn]]
             [slingshot.slingshot :refer [try+ throw+]]))
@@ -305,3 +306,13 @@
        (catch java.sql.SQLSyntaxErrorException e
          (when-not (re-find #"index already exist" (.getMessage e))
            (throw e)))))
+
+(defn attach-txn-info
+  "Attach txn-info to op"
+  [conn op]
+  (try
+    (assoc op :txn-info (json/parse-string (:info (first (query conn ["select @@tidb_last_txn_info info"])))))
+    (catch Exception e
+      (do (info "failed to obtain txn-info:" (.getMessage e)) op))))
+
+(defn select-for-update? [test] (= "FOR UPDATE" (:read-lock test)))

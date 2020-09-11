@@ -36,7 +36,7 @@
       (try
         (let [[table k] (:value op)]
           (c/insert! conn (str "t" table) {:id k})
-          (assoc op :type :ok))
+          (c/attach-txn-info conn (assoc op :type :ok)))
         (catch java.sql.SQLSyntaxErrorException e
           (condp re-find (.getMessage e)
             #"Table .* doesn't exist"

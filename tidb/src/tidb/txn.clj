@@ -66,15 +66,16 @@
 
   (invoke! [this test op]
     (let [txn      (:value op)
-          use-txn? (< 1 (count txn))]
-          ;use-txn? false]
-          (if use-txn?
-            (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
-              (assoc op :type :ok, :value
-                     (mapv (partial mop! c test table-count) txn)))
-            (c/with-error-handling op
-              (assoc op :type :ok, :value
-                     (mapv (partial mop! conn test table-count) txn))))))
+          use-txn? (< 1 (count txn))
+          op'      (if use-txn?
+                     (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+                       (assoc op :type :ok, :value
+                             (mapv (partial mop! c test table-count) txn)))
+                     (c/with-error-handling op
+                       (assoc op :type :ok, :value
+                             (mapv (partial mop! conn test table-count) txn))))]
+      (if (and (every? #(= :r (first %)) txn) (not (c/select-for-update? test)))
+        op' (c/attach-txn-info conn op'))))
 
   (teardown! [this test])
 

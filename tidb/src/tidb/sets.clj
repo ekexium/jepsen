@@ -24,7 +24,7 @@
       (c/with-txn-aborts op
         (case (:f op)
           :add  (do (c/insert! conn :sets (select-keys op [:value]))
-                    (assoc op :type :ok))
+                    (c/attach-txn-info conn (assoc op :type :ok)))
 
           :read (->> (c/query conn ["select * from sets"])
                      (mapv :value)
@@ -49,26 +49,28 @@
                         value   text)"])))
 
   (invoke! [this test op]
-    (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
-      (case (:f op)
-        :add  (let [e (:value op)]
-                (if-let [v (-> (c/query c [(str "select (value) from sets"
-                                                   " where id = 0 "
-                                                   (:read-lock test))])
-                               first
-                               :value)]
-                  (c/execute! c ["update sets set value = ? where id = 0"
-                                    (str v "," e)])
-                  (c/insert! c :sets {:id 0, :value (str e)}))
-                (assoc op :type :ok))
-
-        :read (let [v (-> (c/query c ["select (value) from sets where id = 0"])
-                          first
-                          :value)
-                    v (when v
-                        (->> (str/split v #",")
-                             (map #(Long/parseLong %))))]
-                (assoc op :type :ok, :value v)))))
+    (case (:f op)
+      :add
+      (c/attach-txn-info conn (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+        (let [e (:value op)]
+          (if-let [v (-> (c/query c [(str "select (value) from sets"
+                                             " where id = 0 "
+                                             (:read-lock test))])
+                         first
+                         :value)]
+            (c/execute! c ["update sets set value = ? where id = 0"
+                              (str v "," e)])
+            (c/insert! c :sets {:id 0, :value (str e)}))
+          (assoc op :type :ok))))
+      :read
+      (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+        (let [v (-> (c/query c ["select (value) from sets where id = 0"])
+                        first
+                        :value)
+                  v (when v
+                      (->> (str/split v #",")
+                           (map #(Long/parseLong %))))]
+              (assoc op :type :ok, :value v)))))
 
   (teardown! [_ test])
 
