@@ -52,7 +52,7 @@
     (case (:f op)
       :read
       (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
-        (let [v (read-keys c test (shuffle (keys (:value op))))] (assoc op :type :ok, :value v)))
+        (let [v (read-keys c test (shuffle (keys (:value op))))] (c/attach-current-ts c (assoc op :type :ok, :value v))))
       :inc
       (c/attach-txn-info conn (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
         (let [k (:value op)]

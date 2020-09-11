@@ -311,8 +311,16 @@
   "Attach txn-info to op"
   [conn op]
   (try
-    (assoc op :txn-info (json/parse-string (:info (first (query conn ["select @@tidb_last_txn_info info"])))))
+    (assoc op :txn-info (json/parse-string (:info (first (query conn ["select @@tidb_last_txn_info info"]))) true))
     (catch Exception e
       (do (info "failed to obtain txn-info:" (.getMessage e)) op))))
+
+(defn attach-current-ts
+  "Attach current ts to op"
+  [conn op]
+  (try
+    (assoc op :txn-info (first (query conn ["select @@tidb_current_ts start_ts"])))
+    (catch Exception e
+      (do (info "failed to obtain start-ts:" (.getMessage e)) op))))
 
 (defn select-for-update? [test] (= "FOR UPDATE" (:read-lock test)))

@@ -47,9 +47,9 @@
         (let [op' (j/with-db-transaction [c conn {:isolation (get test :isolation :repeatable-read)}]
                    (let [[id val'] (:value op)]
                      (case (:f op)
-                       :read (assoc op
+                       :read (c/attach-current-ts c (assoc op
                                     :type  :ok
-                                    :value (independent/tuple id (read c test id)))
+                                    :value (independent/tuple id (read c test id))))
 
                        :write (do (c/execute! c [(str "insert into test (id, sk, val) "
                                                       "values (?, ?, ?) "

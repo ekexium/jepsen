@@ -70,7 +70,7 @@
                   v (when v
                       (->> (str/split v #",")
                            (map #(Long/parseLong %))))]
-              (assoc op :type :ok, :value v)))))
+              (c/attach-current-ts c (assoc op :type :ok, :value v))))))
 
   (teardown! [_ test])
 

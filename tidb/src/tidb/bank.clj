@@ -47,10 +47,11 @@
       (case (:f op)
         :read
         (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
-          (->> (c/query c [(str "select * from accounts")])
-               (map (juxt :id :balance))
-               (into (sorted-map))
-               (assoc op :type :ok, :value)))
+          (c/attach-current-ts c
+            (->> (c/query c [(str "select * from accounts")])
+                 (map (juxt :id :balance))
+                 (into (sorted-map))
+                 (assoc op :type :ok, :value))))
         :transfer
         (c/attach-txn-info conn (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
           (let [{:keys [from to amount]} (:value op)
@@ -124,14 +125,15 @@
         (case (:f op)
           :read
           (with-txn op [c conn {:isolation :repeatable-read}]
-            (->> (:accounts test)
-                (map (fn [x]
-                        [x (->> (c/query c [(str "select balance from accounts"
-                                                x)]
-                                         {:row-fn :balance})
-                                first)]))
-                (into (sorted-map))
-                (assoc op :type :ok, :value)))
+            (c/attach-current-ts c
+              (->> (:accounts test)
+                   (map (fn [x]
+                           [x (->> (c/query c [(str "select balance from accounts"
+                                                   x)]
+                                            {:row-fn :balance})
+                                   first)]))
+                   (into (sorted-map))
+                   (assoc op :type :ok, :value))))
 
           :transfer
           (c/attach-txn-info conn (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
