@@ -201,7 +201,7 @@
 
 (defn append-workload
   [opts]
-  {:client (append-client (txn/client {:val-type "text"}))
+  {:client (append-client (txn/client {:val-type "varchar(767)"}))
    :generator (->> (append-txns {:min-txn-length      1
                                  :max-txn-length      4
                                  :key-count           5
