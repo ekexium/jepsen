@@ -29,7 +29,7 @@
                     (:resume-pd :resume-kv :resume-db
                      :start-pd  :start-kv  :start-db) nodes
 
-                    (util/random-nonempty-subset nodes))
+                    (take 1 (util/random-nonempty-subset nodes)))
             ; If the op wants to give us nodes, that's great
             nodes (or (:value op) nodes)]
         (assoc op :value

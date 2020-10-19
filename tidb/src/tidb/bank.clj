@@ -9,6 +9,7 @@
             [knossos.op :as op]
             [clojure.core.reducers :as r]
             [tidb.sql :as c :refer :all]
+            [tidb.util :as util]
             [tidb.basic :as basic]
             [clojure.tools.logging :refer :all]))
 
@@ -20,7 +21,7 @@
 
 (defn txn_ts [c] (first (c/query c ["select @@tidb_current_ts as ts"] {:row-fn :ts})))
 
-(defrecord BankClient [conn]
+(defrecord BankClient [conn checked?]
   client/Client
   (open! [this test node]
     (assoc this :conn (c/open node test)))
@@ -79,17 +80,31 @@
                         (assoc op :type :ok :value (transfer_value (txn_ts c) from to b1 b2 amount)))
                     (do (c/update! c :accounts {:balance b1} ["id = ?" from])
                         (c/update! c :accounts {:balance b2} ["id = ?" to])
-                        (assoc op :type :ok :value (transfer_value (txn_ts c) from to b1 b2 amount)))))))))))
+                        (assoc op :type :ok :value (transfer_value (txn_ts c) from to b1 b2 amount))))))))
+        :ddl
+        (let [action (:value op)]
+          (case action
+            :add-index
+            (assoc op :type :ok :value (c/maybe-add-index! conn "k on accounts(balance)"))
+            :drop-index
+            (assoc op :type :ok :value (c/maybe-drop-index! conn "k on accounts"))
+            :cancel-job
+            (assoc op :type :ok :value (c/maybe-cancel-job! conn)))))))
 
-  (teardown! [_ test])
+  (teardown! [this test]
+    (when (compare-and-set! checked? false true)
+      (c/admin-check-table! conn "accounts")))
 
   (close! [_ test]
     (c/close! conn)))
 
 (defn workload
   [opts]
-  (assoc (bank/test)
-         :client (BankClient. nil)))
+  (let [w (bank/test)
+        g (:generator w)]
+    (assoc w
+      :client    (BankClient. nil (atom false))
+      :generator (gen/stagger 0.05 (util/with-ddl g)))))
 
 (defn cal-sum-total [history]
   (apply + (vals (:value (last (filter #(and (= :ok (:type %)) (= :read (:f %))) history))))))

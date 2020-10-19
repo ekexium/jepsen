@@ -299,6 +299,9 @@ Options:\n")
         (run parsed-opts)
         (System/exit 0)))
 
+    (catch IllegalStateException e
+      (fatal e)
+      (System/exit 1))
     (catch Throwable t
       (fatal t "Oh jeez, I'm sorry, Jepsen broke. Here's why:")
       (System/exit 255))))

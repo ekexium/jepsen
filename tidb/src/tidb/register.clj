@@ -11,6 +11,7 @@
             [clojure.java.jdbc :as j]
             [clojure.tools.logging :refer :all]
             [tidb.sql :as c :refer :all]
+            [tidb.util :as util]
             [tidb.basic :as basic]
             [knossos.model :as model]))
 
@@ -64,7 +65,7 @@
                                 (do (c/update! c :test {:val new-val} ["id = ?" id])
                                     (assoc op :type :ok))
                                 (assoc op :type :fail, :error :precondition-failed))))))]
-            (if (and (= :read (:f op)) (not (c/select-for-update? test)))
+            (if (and (= :read (:f op)) (not (util/select-for-update? test)))
               op' (attach-txn-info conn op'))))))
 
   (teardown! [this test])

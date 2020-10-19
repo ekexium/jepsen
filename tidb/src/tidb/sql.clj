@@ -32,6 +32,8 @@
 
   Returns conn."
   [conn test]
+  (j/execute! conn ["set @@tidb_enable_amend_pessimistic_txn = 1"])
+
   (when-not (= :default (:auto-retry test))
     (info :setting-auto-retry (:auto-retry test))
     (j/execute! conn ["set @@tidb_disable_txn_auto_retry = ?"
@@ -307,6 +309,15 @@
          (when-not (re-find #"index already exist" (.getMessage e))
            (throw e)))))
 
+(defn delete-index!
+  "proxies to j/execute!, but catches \"doesn't exist\" errors
+  transparently."
+  [& args]
+  (try (apply j/execute! args)
+       (catch java.sql.SQLSyntaxErrorException e
+         (when-not (re-find #"doesn't exist" (.getMessage e))
+           (throw e)))))
+
 (defn attach-txn-info
   "Attach txn-info to op"
   [conn op]
@@ -323,4 +334,35 @@
     (catch Exception e
       (do (info "failed to obtain start-ts:" (.getMessage e)) op))))
 
-(defn select-for-update? [test] (= "FOR UPDATE" (:read-lock test)))
+(defn list-pending-jobs
+  [conn]
+  (query conn ["select * from information_schema.ddl_jobs where end_time is null"]))
+
+(defn maybe-add-index!
+  [conn sql-suffix]
+  (let [jobs (list-pending-jobs conn)]
+    (when (> 1 (count jobs))
+      (do (create-index! conn [(str "create index " sql-suffix)]) :done)
+      :skipped)))
+
+(defn maybe-drop-index!
+  [conn sql-suffix]
+  (let [jobs (list-pending-jobs conn)]
+    (if (> 1 (count jobs))
+      (do (delete-index! conn [(str "drop index " sql-suffix)]) :done)
+      :skipped)))
+
+(defn maybe-cancel-job!
+  [conn]
+  (if-let [job (->> (list-pending-jobs conn)
+                    (filter #(= "running" (name (:state %))))
+                    first)]
+      (do (execute! conn [(str "admin cancel ddl jobs " (:job_id job))]) job)
+      :skipped))
+
+(defn admin-check-table!
+  [conn name]
+  (try
+    (execute! conn [(str "admin check table " name)])
+    (catch java.sql.SQLException e
+      (throw (IllegalStateException. "Analysis invalid: admin check table failed" e)))))
