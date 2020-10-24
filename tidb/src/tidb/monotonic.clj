@@ -189,26 +189,40 @@
 
 (defn append-client
   "Wraps a TxnClient, translating string lists back into integers."
-  [client]
+  [client checked?]
   (reify client/Client
     (open! [this test node]
-      (append-client (client/open! client test node)))
+      (append-client (client/open! client test node) checked?))
 
     (setup! [this test]
-      (append-client (client/setup! client test)))
+      (append-client (client/setup! client test) checked?))
 
     (invoke! [this test op]
-      (let [op' (client/invoke! client test op)
-            txn' (mapv (fn [[f k v :as mop]]
-                         (if (= f :r)
-                           ; Rewrite reads to convert "1,2,3" to [1 2 3].
-                           [f k (when v (mapv #(Long/parseLong %)
-                                              (str/split v #",")))]
-                           mop))
-                       (:value op'))]
-        (assoc op' :value txn')))
+      (if (= :ddl (:f op))
+        (let [action (:value op)
+              conn (:conn client)
+              [key-name key-field] (if (< 0.5 (rand)) ["idx_sk_val" "sk, val"] ["idx_val" "val"])]
+          (case action
+            :add-index
+            (assoc op :type :ok :value (c/maybe-add-index! conn (str key-name " on txn" (int (rand 7)) "(" key-field ")")))
+            :drop-index
+            (assoc op :type :ok :value (c/maybe-drop-index! conn (str key-name " on txn" (int (rand 7)))))
+            :cancel-job
+            (assoc op :type :ok :value (c/maybe-cancel-job! conn))))
+        (let [op' (client/invoke! client test op)
+              txn' (mapv (fn [[f k v :as mop]]
+                          (if (= f :r)
+                            ; Rewrite reads to convert "1,2,3" to [1 2 3].
+                            [f k (when v (mapv #(Long/parseLong %)
+                                                (str/split v #",")))]
+                            mop))
+                        (:value op'))]
+          (assoc op' :value txn'))))
 
     (teardown! [this test]
+      (when (compare-and-set! checked? false true)
+        (doseq [n (range 7)]
+          (c/admin-check-table! (:conn client) (str "txn" n))))
       (client/teardown! client test))
 
     (close! [this test]
@@ -220,14 +234,22 @@
   (->> (wr-txns opts)
        (map (partial mapv (fn [[f k v]] [(case f :w :append f) k v])))))
 
+(defn append-checker
+  [opts]
+  (let [impl (append/checker {:anomalies [(if (= :read-committed (:isolation opts)) :G1 :G-single)]
+                              :additional-graphs [cycle/realtime-graph]})]
+    (reify checker/Checker
+      (check [this test history opts]
+        (checker/check impl test (->> history (filter #(not= :ddl (:f %)))) opts)))))
+
 (defn append-workload
   [opts]
-  {:client (append-client (txn/client {:val-type "varchar(767)"}))
+  {:client (append-client (txn/client {:val-type "varchar(767)"}) (atom false))
    :generator (->> (append-txns {:min-txn-length      1
                                  :max-txn-length      4
                                  :key-count           5
                                  :max-writes-per-key  16})
                    (map (fn [txn] {:type :invoke, :f :txn, :value txn}))
-                   gen/seq)
-   :checker (append/checker {:anomalies         [(if (= :read-committed (:isolation opts)) :G1 :G-single)]
-                             :additional-graphs [cycle/realtime-graph]})})
+                   gen/seq
+                   (tiutil/with-ddl))
+   :checker (append-checker opts)})
