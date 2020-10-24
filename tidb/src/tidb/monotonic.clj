@@ -14,7 +14,8 @@
             [jepsen.tests.cycle :as cycle]
             [jepsen.tests.cycle.append :as append]
             [tidb [sql :as c :refer :all]
-                  [txn :as txn]]))
+                  [txn :as txn]
+                  [util :as tiutil]]))
 
 (defn read-key
   "Read a specific key's value from the table. Missing values are represented
@@ -36,7 +37,7 @@
        (into (sorted-map))))
   ;(zipmap ks (map (partial read-key c test) ks)))
 
-(defrecord IncrementClient [conn]
+(defrecord IncrementClient [conn checked?]
   client/Client
   (open! [this test node]
     (assoc this :conn (c/open node test)))
@@ -52,6 +53,16 @@
 
   (invoke! [this test op]
     (case (:f op)
+      :ddl
+      (let [action (:value op)
+            [key-name key-field] (if (< 0.5 (rand)) ["cycle_sk_val" "sk, val"] ["cycle_val" "val"])]
+        (case action
+          :add-index
+          (assoc op :type :ok :value (c/maybe-add-index! conn (str key-name " on cycle(" key-field ")")))
+          :drop-index
+          (assoc op :type :ok :value (c/maybe-drop-index! conn (str key-name " on cycle")))
+          :cancel-job
+          (assoc op :type :ok :value (c/maybe-cancel-job! conn))))
       :read
       (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
         (let [v (read-keys c test (shuffle (keys (:value op))))] (c/attach-current-ts c (assoc op :type :ok, :value v))))
@@ -83,7 +94,9 @@
               ; Still better than nothing.
               (assoc op :type :ok :value {k (inc v)}))))))))
 
-  (teardown! [this test])
+  (teardown! [this test]
+    (when (compare-and-set! checked? false true)
+      (c/admin-check-table! conn "cycle")))
 
   (close! [this test]
     (c/close! conn)))
@@ -100,17 +113,23 @@
           :f :inc
           :value (rand-int key-count)}))
 
+(defn cycle-checker
+  []
+  (let [impl (cycle/checker (cycle/combine cycle/monotonic-key-graph cycle/realtime-graph))]
+    (reify checker/Checker
+      (check [this test history opts]
+        (checker/check impl test (->> history (filter #(not= :ddl (:f %)))) opts)))))
+
 (defn inc-workload
   [opts]
   (let [key-count 8]
-    {:client (IncrementClient. nil)
+    {:client (IncrementClient. nil (atom false))
      :checker (checker/compose
-                {:cycle (cycle/checker
-                          (cycle/combine cycle/monotonic-key-graph
-                                         cycle/realtime-graph))
+                {:cycle (cycle-checker)
                  :timeline (timeline/html)})
      :generator (->> (gen/mix [(incs key-count)
-                               (reads key-count)]))}))
+                               (reads key-count)])
+                     (tiutil/with-ddl))}))
 
 (defn wr-txns
   "A lazy sequence of write and read transactions over a pool of n numeric
