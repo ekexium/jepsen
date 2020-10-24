@@ -27,7 +27,7 @@
                                    (:read-lock test))
                               k]))))
 
-(defrecord AtomicClient [conn]
+(defrecord AtomicClient [conn checked?]
   client/Client
 
   (open! [this test node]
@@ -45,9 +45,19 @@
   (invoke! [this test op]
     (c/with-error-handling op
       (c/with-txn-aborts op
-        (let [op' (j/with-db-transaction [c conn {:isolation (get test :isolation :repeatable-read)}]
-                   (let [[id val'] (:value op)]
-                     (case (:f op)
+        (if (= :ddl (:f op))
+          (let [action (:value op)
+            [key-name key-field] (if (< 0.5 (rand)) ["test_sk_val" "sk, val"] ["test_val" "val"])]
+            (case action
+              :add-index
+              (assoc op :type :ok :value (c/maybe-add-index! conn (str key-name " on test(" key-field ")")))
+              :drop-index
+              (assoc op :type :ok :value (c/maybe-drop-index! conn (str key-name " on test")))
+              :cancel-job
+              (assoc op :type :ok :value (c/maybe-cancel-job! conn))))
+          (let [op' (j/with-db-transaction [c conn {:isolation (get test :isolation :repeatable-read)}]
+                    (let [[id val'] (:value op)]
+                      (case (:f op)
                        :read (c/attach-current-ts c (assoc op
                                     :type  :ok
                                     :value (independent/tuple id (read c test id))))
@@ -66,16 +76,25 @@
                                     (assoc op :type :ok))
                                 (assoc op :type :fail, :error :precondition-failed))))))]
             (if (and (= :read (:f op)) (not (util/select-for-update? test)))
-              op' (attach-txn-info conn op'))))))
+              op' (attach-txn-info conn op')))))))
 
-  (teardown! [this test])
+  (teardown! [this test]
+    (when (compare-and-set! checked? false true)
+      (c/admin-check-table! conn "test")))
 
   (close! [this test]
     (c/close! conn)))
+
+(defn register-checker-wrapper
+  [impl]
+  (reify checker/Checker
+    (check [this test history opts]
+      (checker/check impl test (->> history (filter #(not= :ddl (:f %)))) opts))))
 
 (defn workload
   [opts]
   (let [w (lr/test (assoc opts :model (model/cas-register 0)))]
     (-> w
-        (assoc :client (AtomicClient. nil))
-        (update :generator (partial gen/stagger 1/10)))))
+        (assoc :client (AtomicClient. nil (atom false)))
+        (update :checker register-checker-wrapper)
+        (update :generator #(gen/stagger 1/10 (util/with-ddl %))))))
