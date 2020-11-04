@@ -47,14 +47,14 @@
     (try
       (case (:f op)
         :read
-        (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+        (with-txn op [c conn {:isolation (util/isolation-level test)}]
           (c/attach-current-ts c
             (->> (c/query c [(str "select * from accounts")])
                  (map (juxt :id :balance))
                  (into (sorted-map))
                  (assoc op :type :ok, :value))))
         :transfer
-        (c/attach-txn-info conn (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+        (c/attach-txn-info conn (with-txn op [c conn {:isolation (util/isolation-level test)}]
           (let [{:keys [from to amount]} (:value op)
                 b1 (-> c
                        (c/query [(str "select * from accounts where id = ? "
@@ -151,7 +151,7 @@
                    (assoc op :type :ok, :value))))
 
           :transfer
-          (c/attach-txn-info conn (with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+          (c/attach-txn-info conn (with-txn op [c conn {:isolation (util/isolation-level test)}]
             (let [{:keys [from to amount]} (:value op)
                   from (str "accounts" from)
                   to   (str "accounts" to)

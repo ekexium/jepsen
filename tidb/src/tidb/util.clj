@@ -20,3 +20,5 @@
 (defn with-ddl [g] (WithDDL. g))
 
 (defn select-for-update? [test] (= "FOR UPDATE" (:read-lock test)))
+
+(defn isolation-level [test] (get test :isolation :repeatable-read))

@@ -69,7 +69,7 @@
     (let [txn      (:value op)
           use-txn? (< 1 (count txn))
           op'      (if use-txn?
-                     (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+                     (c/with-txn op [c conn {:isolation (util/isolation-level test)}]
                        (c/attach-current-ts c (assoc op :type :ok, :value
                              (mapv (partial mop! c test table-count) txn))))
                      (c/with-error-handling op

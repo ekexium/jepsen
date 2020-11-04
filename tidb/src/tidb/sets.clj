@@ -6,6 +6,7 @@
                     [generator :as gen]]
             [knossos.op :as op]
             [tidb.sql :as c :refer :all]
+            [tidb.util :as util]
             [tidb.basic :as basic]))
 
 (defrecord SetClient [conn]
@@ -51,7 +52,7 @@
   (invoke! [this test op]
     (case (:f op)
       :add
-      (c/attach-txn-info conn (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+      (c/attach-txn-info conn (c/with-txn op [c conn {:isolation (util/isolation-level test)}]
         (let [e (:value op)]
           (if-let [v (-> (c/query c [(str "select (value) from sets"
                                              " where id = 0 "
@@ -63,7 +64,7 @@
             (c/insert! c :sets {:id 0, :value (str e)}))
           (assoc op :type :ok))))
       :read
-      (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+      (c/with-txn op [c conn {:isolation (util/isolation-level test)}]
         (let [v (-> (c/query c ["select (value) from sets where id = 0"])
                         first
                         :value)

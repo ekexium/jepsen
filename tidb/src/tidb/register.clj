@@ -55,7 +55,7 @@
               (assoc op :type :ok :value (c/maybe-drop-index! conn (str key-name " on test")))
               :cancel-job
               (assoc op :type :ok :value (c/maybe-cancel-job! conn))))
-          (let [op' (j/with-db-transaction [c conn {:isolation (get test :isolation :repeatable-read)}]
+          (let [op' (j/with-db-transaction [c conn {:isolation (util/isolation-level test)}]
                     (let [[id val'] (:value op)]
                       (case (:f op)
                        :read (c/attach-current-ts c (assoc op

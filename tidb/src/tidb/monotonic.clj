@@ -8,14 +8,13 @@
             [clojure.tools.logging :refer [info]]
             [jepsen [client :as client]
                     [checker :as checker]
-                    [generator :as gen]
-                    [util :as util]]
+                    [generator :as gen]]
             [jepsen.checker.timeline :as timeline]
             [jepsen.tests.cycle :as cycle]
             [jepsen.tests.cycle.append :as append]
             [tidb [sql :as c :refer :all]
                   [txn :as txn]
-                  [util :as tiutil]]))
+                  [util :as util]]))
 
 (defn read-key
   "Read a specific key's value from the table. Missing values are represented
@@ -24,7 +23,8 @@
    (read-key c test k false))
   ([c test k lock?]
    (-> (c/query c [(str "select (val) from cycle where "
-                        (if (:use-index test) "sk" "pk") " = ?" (when lock? " for update"))
+                        (if (:use-index test) "sk" "pk") " = ?"
+                        (when (or lock? (not-empty (:read-lock test))) " for update"))
                    k])
        first
        (:val -1))))
@@ -32,9 +32,13 @@
 (defn read-keys
   "Read several keys values from the table, returning a map of keys to values."
   [c test ks]
-  (->> (map (partial read-key c test) ks)
-       (zipmap ks)
-       (into (sorted-map))))
+  (if (= :read-committed (util/isolation-level test))
+    (->> (c/query c [(str "select sk, val from cycle")])
+         (map #(hash-map (:sk %) (:val %)))
+         (into (sorted-map)))
+    (->> (map (partial read-key c test) ks)
+         (zipmap ks)
+         (into (sorted-map)))))
   ;(zipmap ks (map (partial read-key c test) ks)))
 
 (defrecord IncrementClient [conn checked?]
@@ -64,10 +68,13 @@
           :cancel-job
           (assoc op :type :ok :value (c/maybe-cancel-job! conn))))
       :read
-      (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
-        (let [v (read-keys c test (shuffle (keys (:value op))))] (c/attach-current-ts c (assoc op :type :ok, :value v))))
+      (let [op' (c/with-txn op [c conn {:isolation (util/isolation-level test)}]
+                  (let [reorder (if (= :optimistic (:txn-mode test)) shuffle sort)
+                        v (read-keys c test (reorder (keys (:value op))))]
+                    (c/attach-current-ts c (assoc op :type :ok, :value v))))]
+        (if (empty? (:read-lock test)) op' (c/attach-txn-info conn op')))
       :inc
-      (c/attach-txn-info conn (c/with-txn op [c conn {:isolation (get test :isolation :repeatable-read)}]
+      (c/attach-txn-info conn (c/with-txn op [c conn {:isolation (util/isolation-level test)}]
         (let [k (:value op)]
           (if (:update-in-place test)
             ; Update directly
@@ -105,7 +112,7 @@
   (fn [] {:type  :invoke
           :f     :read
           :value (-> (range key-count)
-                     ;util/random-nonempty-subset
+                     ;jepsen.util/random-nonempty-subset
                      (zipmap (repeat nil)))}))
 
 (defn incs [key-count]
@@ -129,7 +136,7 @@
                  :timeline (timeline/html)})
      :generator (->> (gen/mix [(incs key-count)
                                (reads key-count)])
-                     (tiutil/with-ddl))}))
+                     (util/with-ddl))}))
 
 (defn wr-txns
   "A lazy sequence of write and read transactions over a pool of n numeric
@@ -251,5 +258,5 @@
                                  :max-writes-per-key  16})
                    (map (fn [txn] {:type :invoke, :f :txn, :value txn}))
                    gen/seq
-                   (tiutil/with-ddl))
+                   (util/with-ddl))
    :checker (append-checker opts)})
