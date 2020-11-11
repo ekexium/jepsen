@@ -365,4 +365,5 @@
   (try
     (execute! conn [(str "admin check table " name)])
     (catch java.sql.SQLException e
-      (throw (IllegalStateException. "Analysis invalid: admin check table failed" e)))))
+      (when (str/includes? (.getMessage e) "admin:82")
+        (throw (IllegalStateException. "Analysis invalid: admin check table failed" e))))))
