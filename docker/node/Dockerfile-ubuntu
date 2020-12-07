@@ -1,5 +1,17 @@
 FROM       jacobmbr/ubuntu-jepsen:v0.1.0
+ENV HTTP_PROXY "http://127.0.0.1:7890"
+ENV HTTPS_PROXY "http://127.0.0.1:7890"
+RUN echo "deb http://mirrors.163.com/debian/ buster main non-free contrib" > /etc/apt/sources.list
+RUN echo "deb http://mirrors.163.com/debian/ buster-updates main non-free contrib" >> /etc/apt/sources.list
+RUN echo "deb http://mirrors.163.com/debian/ buster-backports main non-free contrib" >> /etc/apt/sources.list
+RUN echo "deb http://mirrors.163.com/debian-security/ buster/updates main non-free contrib" >> /etc/apt/sources.list
 
+RUN echo "deb-src http://mirrors.163.com/debian/ buster main non-free contrib" >> /etc/apt/sources.list
+RUN echo "deb-src http://mirrors.163.com/debian/ buster-updates main non-free contrib" >> /etc/apt/sources.list
+RUN echo "deb-src http://mirrors.163.com/debian/ buster-backports main non-free contrib" >> /etc/apt/sources.list
+RUN echo "deb-src http://mirrors.163.com/debian-security/ buster/updates main non-free contrib" >> /etc/apt/sources.list
+RUN echo "151.101.108.133 raw.githubusercontent.com" >> /etc/hosts
+RUN echo -e "nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\noptions edns0" > /etc/resolv.conf
 RUN rm /etc/apt/apt.conf.d/docker-clean && apt-get update
 
 # Install Jepsen dependencies
