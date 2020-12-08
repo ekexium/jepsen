@@ -7,23 +7,24 @@
             [clojure.string :as str]
             [clojure.java.io :as io]
             [jepsen [cli :as jc]
-                    [checker :as checker]
-                    [core :as jepsen]
-                    [generator :as gen]
-                    [os :as os]
-                    [tests :as tests]
-                    [util :as util]]
+             [checker :as checker]
+             [core :as jepsen]
+             [generator :as gen]
+             [os :as os]
+             [tests :as tests]
+             [util :as util]]
             [jepsen.os.debian :as debian]
             [jepsen.os.centos :as centos]
             [tidb [bank :as bank]
-                  [db :as db]
-                  [long-fork :as long-fork]
-                  [monotonic :as monotonic]
-                  [nemesis :as nemesis]
-                  [register :as register]
-                  [sequential :as sequential]
-                  [sets :as set]
-                  [table :as table]]))
+             [comments :as comments]
+             [db :as db]
+             [long-fork :as long-fork]
+             [monotonic :as monotonic]
+             [nemesis :as nemesis]
+             [register :as register]
+             [sequential :as sequential]
+             [sets :as set]
+             [table :as table]]))
 
 (def oses
   "Supported operating systems"
@@ -36,6 +37,7 @@
   workloads."
   {:bank            bank/workload
    :bank-multitable bank/multitable-workload
+   :comments        comments/workload
    :long-fork       long-fork/workload
    :monotonic       monotonic/inc-workload
    :txn-cycle       monotonic/txn-workload
@@ -61,6 +63,8 @@
                      :auto-retry-limit  [10 0]
                      :update-in-place   [true false]
                      :read-lock         [nil "FOR UPDATE"]}
+   :comments        {:auto-retry        [true false]
+                     :auto-retry-limit  [10 0]}
    :long-fork       {:auto-retry        [true false]
                      :auto-retry-limit  [10 0]
                      :use-index         [true false]}
@@ -93,10 +97,10 @@
   (-> (util/map-vals (fn [opts]
                        (let [opts (-> opts
                                       (assoc
-                                        :auto-retry        [:default]
-                                        :auto-retry-limit  [:default]
-                                        :update-in-place   [false]
-                                        :read-lock         [nil])
+                                       :auto-retry        [:default]
+                                       :auto-retry-limit  [:default]
+                                       :update-in-place   [false]
+                                       :read-lock         [nil])
                                       (update :use-index
                                               (partial filter true?)))]
                          ; Don't generate an empty use-index option
@@ -182,25 +186,25 @@
   "All nemesis specs to run as a part of a complete test suite."
   (->> (concat
          ; No faults
-         [[]]
+        [[]]
          ; Single types of faults
-         (map vector process-faults)
-         (map vector network-faults)
-         (map vector schedule-faults)
+        (map vector process-faults)
+        (map vector network-faults)
+        (map vector schedule-faults)
          ; (map vector clock-faults)
          ; Compound faults of one class
-         [[:kill]
-          [:pause]
-          [:schedules]]
+        [[:kill]
+         [:pause]
+         [:schedules]]
          ; Clock skew plus other faults
          ; (cartesian-product clock-faults
                            ;  (concat process-faults
                            ;          network-faults
                            ;          schedule-faults))
          ; Schedules plus process & network faults
-         (cartesian-product schedule-faults
-                            (concat process-faults
-                                    network-faults))
+        (cartesian-product schedule-faults
+                           (concat process-faults
+                                   network-faults))
         ; Everything
         [(concat process-faults
                  network-faults
@@ -214,11 +218,11 @@
   "A restricted set of failures for quick testing"
   (->> (concat
          ; No faults
-         [[]]
+        [[]]
          ; Single types of faults
-         (map vector process-faults)
-         (map vector network-faults)
-         (map vector schedule-faults)
+        (map vector process-faults)
+        (map vector network-faults)
+        (map vector schedule-faults)
          ; (map vector clock-faults)
         ; Everything
         [(concat process-faults
@@ -301,9 +305,9 @@
                     (str " isolation " (:isolation opts)))
                   (when-not (= [:interval] (keys (:nemesis opts)))
                     (str " nemesis " (->> (dissoc (:nemesis opts)
-                                                   :interval
-                                                   :schedule
-                                                   :long-recovery)
+                                                  :interval
+                                                  :schedule
+                                                  :long-recovery)
                                           keys
                                           (map name)
                                           sort
@@ -331,9 +335,9 @@
             :generator  gen
             :plot       plot-spec
             :checker    (checker/compose
-                          {:perf        (checker/perf)
+                         {:perf        (checker/perf)
                            ; :clock-skew  (checker/clock-plot)
-                           :workload    (:checker workload)})})))
+                          :workload    (:checker workload)})})))
 
 (defn parse-nemesis-spec
   "Parses a comma-separated string of nemesis types, and turns it into an
@@ -354,9 +358,9 @@
     :parse-fn #(Double/parseDouble %)
     :validate [pos? "should be a positive number"]]
 
-    [nil "--force-reinstall" "Don't re-use an existing TiDB directory"]
+   [nil "--force-reinstall" "Don't re-use an existing TiDB directory"]
 
-    [nil "--nemesis-interval SECONDS"
+   [nil "--nemesis-interval SECONDS"
     "Roughly how long to wait between nemesis operations. Default: 10s."
     :parse-fn parse-long
     :assoc-fn (fn [m k v] (update m :nemesis assoc :interval v))
@@ -500,24 +504,24 @@
                                   workload  workloads
                                   i         (range (:test-count options))]
                               (do
-                              (-> options
-                                  (merge workload)
-                                  (update :nemesis merge nemesis))))]
+                                (-> options
+                                    (merge workload)
+                                    (update :nemesis merge nemesis))))]
                   (->> tests
                        (map-indexed
-                         (fn [i test-opts]
-                           (try
-                             (info "\n\n\nTest " (inc i) "/" (count tests))
-                             (jepsen/run! (test test-opts))
-                             (catch Exception e
-                               (warn e "Test crashed; moving on...")))))
+                        (fn [i test-opts]
+                          (try
+                            (info "\n\n\nTest " (inc i) "/" (count tests))
+                            (jepsen/run! (test test-opts))
+                            (catch Exception e
+                              (warn e "Test crashed; moving on...")))))
                        dorun)))}})
 
 (defn -main
   [& args]
   (jc/run!
-    (merge (jc/serve-cmd)
-           (test-all-cmd)
-           (jc/single-test-cmd {:test-fn  test
-                                :opt-spec (concat cli-opts single-test-opts)}))
-    args))
+   (merge (jc/serve-cmd)
+          (test-all-cmd)
+          (jc/single-test-cmd {:test-fn  test
+                               :opt-spec (concat cli-opts single-test-opts)}))
+   args))
