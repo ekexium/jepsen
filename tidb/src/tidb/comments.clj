@@ -17,6 +17,7 @@
              [generator :as gen]
              [independent :as independent]
              [util :as util :refer [meh]]]
+            [jepsen.tests.causal-reverse :as cr]
             [clojure.set :as set]
             [clojure.tools.logging :refer :all]
             [tidb.sql :as c :refer :all]
@@ -80,79 +81,8 @@
   (close! [this test]
     (c/close! conn)))
 
-(defn checker
-  []
-  (reify checker/Checker
-    (check [this test history opts]
-      ; Determine first-order write precedence graph
-      (let [expected (loop [completed  (sorted-set)
-                            expected   {}
-                            [op & more :as history] history]
-                       (cond
-                         ; Done
-                         (not (seq history))
-                         expected
-
-                         ; We know this value is definitely written
-                         (= :write (:f op))
-                         (cond ; Write is beginning; record precedence
-                           (op/invoke? op)
-                           (recur completed
-                                  (assoc expected (:value op) completed)
-                                  more)
-
-                               ; Write is completing; we can now expect to see
-                               ; it
-                           (op/ok? op)
-                           (recur (conj completed (:value op))
-                                  expected more)
-
-                           true
-                           (recur completed expected more))
-
-                         true
-                         (recur completed expected more)))
-            errors (->> history
-                        (r/filter op/ok?)
-                        (r/filter #(= :read (:f %)))
-                        (reduce (fn [errors op]
-                                  (let [seen         (:value op)
-                                        our-expected (->> seen
-                                                          (map expected)
-                                                          (reduce set/union))
-                                        missing (set/difference our-expected
-                                                                seen)]
-                                    (if (empty? missing)
-                                      errors
-                                      (conj errors
-                                            (-> op
-                                                (dissoc :value)
-                                                (assoc :missing missing)
-                                                (assoc :expected-count
-                                                       (count our-expected)))))))
-                                []))]
-        {:valid? (empty? errors)
-         :errors errors}))))
-
-(defn reads [] {:type :invoke, :f :read, :value nil})
-(defn writes []
-  (->> (range)
-       (map (fn [k] {:type :invoke, :f :write, :value k}))
-       gen/seq))
-
 (defn workload
   [opts]
-  (let [reads (reads)
-        writes (writes)]
-    {:name   "comments"
-     :client   (CommentsClient. 10 (atom false) nil)
-     :generator (independent/concurrent-generator
-                 (count (:nodes opts))
-                 (range)
-                 (fn [k]
-                   (->> (gen/mix [reads writes])
-                        (gen/stagger 1/100)
-                        (gen/limit 500))))
-     :checker (checker/compose
-               {:perf       (checker/perf)
-                :sequential (independent/checker (checker))})}))
+  (assoc (cr/workload opts)
+         :name   "comments"
+         :client (CommentsClient. 10 (atom false) nil)))
