@@ -162,12 +162,15 @@
     :kill-pd
     :kill-kv
     :kill-db
+    :kill-tikv-worker
     :stop-pd
     :stop-kv
     :stop-db
+    :stop-tikv-worker
     :pause-pd
     :pause-kv
     :pause-db
+    :pause-tikv-worker
     :schedules
     :shuffle-leader
     :shuffle-region
@@ -181,7 +184,9 @@
 
 (def process-faults
   "Faults affecting individual processes"
-  [:kill-pd :kill-kv :kill-db :stop-pd :stop-kv :stop-db :pause-pd :pause-kv :pause-db])
+  [:kill-pd :kill-kv :kill-db :kill-tikv-worker
+   :stop-pd :stop-kv :stop-db :stop-tikv-worker
+   :pause-pd :pause-kv :pause-db :pause-tikv-worker])
 
 (def network-faults
   "Faults affecting the network"
@@ -266,6 +271,10 @@
                :color       "#E9A0CF"
                :start       #{:kill-db :stop-db}
                :stop        #{:start-db}}
+              {:name        "kill tikv-worker"
+               :color       "#E9C0A0"
+               :start       #{:kill-tikv-worker :stop-tikv-worker}
+               :stop        #{:start-tikv-worker}}
               {:name        "pause pd"
                :color       "#C5A0E9"
                :start       #{:pause-pd}
@@ -278,6 +287,10 @@
                :color       "#A6A0E9"
                :start       #{:pause-db}
                :stop        #{:resume-db}}
+              {:name        "pause tikv-worker"
+               :color       "#D9C0A0"
+               :start       #{:pause-tikv-worker}
+               :stop        #{:resume-tikv-worker}}
               {:name        "shuffle-leader"
                :color       "#A6D0E9"
                :start       #{:shuffle-leader}
