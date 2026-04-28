@@ -321,7 +321,6 @@
        :chdir   tidb-dir}
       (str "./bin/" tikv-worker-bin)
       :--addr                  (str "0.0.0.0:" tikv-worker-port)
-      :--advertise-addr        (str (name node) ":" tikv-worker-port)
       :--pd-endpoints          (pd-endpoints test)
       :--config                tikv-worker-config-file
       :--data-dir              tikv-worker-data-dir)))
@@ -357,7 +356,7 @@
 (defn tikv-worker-ready?
   "Is TiKV-Worker ready?"
   []
-  (page-ready? (str "http://127.0.0.1:" tikv-worker-port "/status")))
+  (page-ready? (str "http://127.0.0.1:" tikv-worker-port "/healthz")))
 
 (defn restart-loop*
   "TiDB is fragile on startup; processes love to crash if they can't complete
