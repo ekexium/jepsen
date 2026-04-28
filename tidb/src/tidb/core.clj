@@ -257,6 +257,13 @@
        ; Convert to maps like {:fault-type true}
        (map (fn [faults] (zipmap faults (repeat true))))))
 
+(defn without-tikv-worker-faults
+  "Drops TiKV-Worker nemesis options from generated test suites."
+  [nemeses]
+  (->> nemeses
+       (map #(apply dissoc % nemesis/tikv-worker-faults))
+       distinct))
+
 (def plot-spec
   "Specification for how to render operations in plots"
   {:nemeses #{{:name        "kill pd"
@@ -604,9 +611,11 @@
                                       workload-options)
                       workloads (cond->> (all-workload-options workload-opts)
                                   w (filter (comp #{w} :workload)))
-                      nemeses   (cond
-                                  (:quick options)  quick-nemeses
-                                  true              all-nemeses)
+                      nemeses   (cond->> (if (:quick options)
+                                           quick-nemeses
+                                           all-nemeses)
+                                  (not (:enable-system-tidb options))
+                                  without-tikv-worker-faults)
                       tests (for [nemesis   nemeses
                                   workload  workloads
                                   i         (range (:test-count options))]

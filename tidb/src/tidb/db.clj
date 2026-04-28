@@ -143,7 +143,7 @@
 (defn configure-tikv-worker!
   "Writes configuration file for tikv-worker"
   []
-  (c/su (c/exec :echo (slurp (io/resource "tikv-worker.toml"))
+  (c/su (c/exec :echo (slurp (io/resource "tikv-worker.conf"))
                 :> tikv-worker-config-file)))
 
 (defn configure!
@@ -323,6 +323,7 @@
       :--addr                  (str "0.0.0.0:" tikv-worker-port)
       :--pd-endpoints          (pd-endpoints test)
       :--config                tikv-worker-config-file
+      :--log-file              tikv-worker-log-file
       :--data-dir              tikv-worker-data-dir)))
 
 (defn page-ready?

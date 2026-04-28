@@ -262,6 +262,17 @@
   ([f v & args]
    (apply assoc (op f v) args)))
 
+(def tikv-worker-faults
+  "Nemesis options that require TiKV-Worker to be configured and running."
+  #{:kill-tikv-worker
+    :stop-tikv-worker
+    :pause-tikv-worker})
+
+(defn uses-tikv-worker?
+  "True if nemesis options directly target TiKV-Worker."
+  [n]
+  (some tikv-worker-faults (keys n)))
+
 (defn partition-one-gen
   "A generator for a partition that isolates one node."
   [test process]
@@ -478,21 +489,24 @@
 
 (defn expand-options
   "We support shorthand options in nemesis maps, like :kill, which expands to
-  :kill-pd, :kill-kv, :kill-db, and :kill-tikv-worker. This function expands those."
-  [n]
+  process-specific faults. This function expands those."
+  [n enable-tikv-worker?]
   (cond-> n
     (:kill n) (assoc :kill-pd true
                      :kill-kv true
-                     :kill-db true
-                     :kill-tikv-worker true)
+                     :kill-db true)
+    (and (:kill n) enable-tikv-worker?)
+    (assoc :kill-tikv-worker true)
     (:stop n) (assoc :stop-pd true
                      :stop-kv true
-                     :stop-db true
-                     :stop-tikv-worker true)
+                     :stop-db true)
+    (and (:stop n) enable-tikv-worker?)
+    (assoc :stop-tikv-worker true)
     (:pause n) (assoc :pause-pd true
                       :pause-kv true
-                      :pause-db true
-                      :pause-tikv-worker true)
+                      :pause-db true)
+    (and (:pause n) enable-tikv-worker?)
+    (assoc :pause-tikv-worker true)
     (:schedules n) (assoc :shuffle-leader true
                           :shuffle-region true
                           :random-merge true)
@@ -506,7 +520,13 @@
 (defn nemesis
   "Composite nemesis and generator, given test options."
   [opts]
-  (let [n (expand-options (:nemesis opts))]
+  (let [enable-tikv-worker? (:enable-system-tidb opts)
+        n (expand-options (:nemesis opts) enable-tikv-worker?)]
+    (when (and (not enable-tikv-worker?)
+               (uses-tikv-worker? n))
+      (throw+ {:type    :tikv-worker-nemesis-requires-system-tidb
+               :message "tikv-worker nemesis requires --enable-system-tidb"
+               :nemesis (select-keys n tikv-worker-faults)}))
     {:nemesis         (full-nemesis n)
      :generator       (full-generator n)
      :final-generator (final-generator n)}))
