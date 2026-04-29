@@ -607,7 +607,7 @@
         (c/su
           (install! test node)
           (configure!)
-          (when enable-system?
+          (when enable-tidbx?
             (configure-system-db!)
             (configure-tikv-worker!))
           (jepsen/synchronize test 180)
@@ -622,7 +622,7 @@
                 (jepsen/synchronize test)
 
                 ; Start tikv-worker after TiKV, before waiting for replicas
-                (when enable-system?
+                (when enable-tidbx?
                   (start-wait-tikv-worker! test node)
                   (jepsen/synchronize test))
 
@@ -634,7 +634,7 @@
 
                 (Thread/sleep 5000)
 
-                (when enable-system?
+                (when enable-tidbx?
                   (start-wait-system-db! test node)
                   (jepsen/synchronize test)
                   (Thread/sleep 10000))
