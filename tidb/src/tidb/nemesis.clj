@@ -524,7 +524,7 @@
         n (expand-options (:nemesis opts) enable-tikv-worker?)]
     (when (and (not enable-tikv-worker?)
                (uses-tikv-worker? n))
-      (throw+ {:type    :tikv-worker-nemesis-requires-system-tidb
+      (throw+ {:type    :tikv-worker-nemesis-requires-tidbx
                :message "tikv-worker nemesis requires --enable-tidbx"
                :nemesis (select-keys n tikv-worker-faults)}))
     {:nemesis         (full-nemesis n)

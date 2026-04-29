@@ -593,7 +593,7 @@
   []
   (reify db/DB
     (setup! [_ test node]
-      (let [enable-system? (:enable-tidbx test)]
+      (let [enable-tidbx? (:enable-tidbx test)]
         (info node "resetting TiDB")
         (c/su
           (stop! test node)

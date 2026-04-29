@@ -428,7 +428,7 @@
 
    [nil "--force-reinstall" "Don't re-use an existing TiDB directory"]
 
-   [nil "--enable-tidbx" "Start a dedicated SYSTEM keyspace TiDB alongside the primary instance."
+   [nil "--enable-tidbx" "Enable TiDBX mode."
     :default false]
 
    [nil "--nemesis-interval SECONDS"
