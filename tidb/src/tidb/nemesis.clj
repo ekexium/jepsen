@@ -520,12 +520,12 @@
 (defn nemesis
   "Composite nemesis and generator, given test options."
   [opts]
-  (let [enable-tikv-worker? (:enable-system-tidb opts)
+  (let [enable-tikv-worker? (:enable-tidbx opts)
         n (expand-options (:nemesis opts) enable-tikv-worker?)]
     (when (and (not enable-tikv-worker?)
                (uses-tikv-worker? n))
       (throw+ {:type    :tikv-worker-nemesis-requires-system-tidb
-               :message "tikv-worker nemesis requires --enable-system-tidb"
+               :message "tikv-worker nemesis requires --enable-tidbx"
                :nemesis (select-keys n tikv-worker-faults)}))
     {:nemesis         (full-nemesis n)
      :generator       (full-generator n)

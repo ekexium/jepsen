@@ -428,7 +428,7 @@
 
    [nil "--force-reinstall" "Don't re-use an existing TiDB directory"]
 
-   [nil "--enable-system-tidb" "Start a dedicated SYSTEM keyspace TiDB alongside the primary instance."
+   [nil "--enable-tidbx" "Start a dedicated SYSTEM keyspace TiDB alongside the primary instance."
     :default false]
 
    [nil "--nemesis-interval SECONDS"
@@ -614,7 +614,7 @@
                       nemeses   (cond->> (if (:quick options)
                                            quick-nemeses
                                            all-nemeses)
-                                  (not (:enable-system-tidb options))
+                                  (not (:enable-tidbx options))
                                   without-tikv-worker-faults)
                       tests (for [nemesis   nemeses
                                   workload  workloads

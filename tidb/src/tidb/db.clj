@@ -481,7 +481,7 @@
 (defn stop!
   "Stops all daemons"
   [test node]
-  (when (:enable-system-tidb test)
+  (when (:enable-tidbx test)
     (stop-system-db! test node)
     (stop-tikv-worker! test node))
   (stop-db! test node)
@@ -593,7 +593,7 @@
   []
   (reify db/DB
     (setup! [_ test node]
-      (let [enable-system? (:enable-system-tidb test)]
+      (let [enable-system? (:enable-tidbx test)]
         (info node "resetting TiDB")
         (c/su
           (stop! test node)
@@ -675,7 +675,7 @@
                             db-stdout
                             kv-log-file
                             kv-stdout]
-                     (:enable-system-tidb test)
+                     (:enable-tidbx test)
                      (into [system-db-log-file
                             system-db-slow-file
                             system-db-stdout
