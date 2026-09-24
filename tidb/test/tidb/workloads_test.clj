@@ -125,3 +125,32 @@
       (is (not= false (:valid? (check-workload workload
                                              {:isolation :read-committed}
                                              hist)))))))
+
+;; Minimized from a real kill/restart history. It is allowed by SI plus the
+;; original realtime checks, but rejected by strong SI.
+(def realtime-scope-history
+ [{:process 0 :type :invoke :f :txn :value [[:append 0 1]]}
+  {:process 1 :type :invoke :f :txn :value [[:append 1 1] [:r 0 nil]]}
+  {:process 2 :type :invoke :f :txn :value [[:r 1 nil] [:append 0 2]]}
+  {:process 1 :type :ok :f :txn :value [[:append 1 1] [:r 0 nil]]}
+  {:process 3 :type :invoke :f :txn :value [[:r 0 nil]]}
+  {:process 3 :type :ok :f :txn :value [[:r 0 nil]]}
+  {:process 0 :type :ok :f :txn :value [[:append 0 1]]}
+  {:process 2 :type :ok :f :txn :value [[:r 1 nil] [:append 0 2]]}
+  {:process 4 :type :invoke :f :txn :value [[:r 0 nil]]}
+  {:process 4 :type :ok :f :txn :value [[:r 0 [1 2]]]}])
+(def future-read-history
+ [{:process 0 :type :invoke :f :txn :value [[:r 0 nil]]}
+  {:process 0 :type :ok :f :txn :value [[:r 0 [1]]]}
+  {:process 1 :type :invoke :f :txn :value [[:append 0 1]]}
+  {:process 1 :type :ok :f :txn :value [[:append 0 1]]}])
+
+(deftest migration-preserves-original-realtime-scope
+  (is (true? (:valid? (check-workload monotonic/append-workload {}
+                                    (history realtime-scope-history))))))
+
+(deftest completed-reads-cannot-observe-future-invocations
+  (doseq [isolation [:repeatable-read :read-committed]]
+    (is (false? (:valid? (check-workload monotonic/append-workload
+                                        {:isolation isolation}
+                                        (history future-read-history)))))))

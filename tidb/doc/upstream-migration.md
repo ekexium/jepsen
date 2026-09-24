@@ -22,14 +22,14 @@ Java directly, use `java -Djava.awt.headless=true -cp <jar> tidb.core ...`.
 Leiningen and the derived CI image set headless mode automatically.
 
 The current CI control image `hub.pingcap.net/qa/jepsen-control-base:250611`
-contains Java 8. Build its Java 21 derivative before switching the JAR:
+contains Java 8 and lacks git. Build its Java 21 derivative before switching the JAR:
 
 ```sh
 docker build -f docker/control/Dockerfile-java21 \
   -t jepsen-control-java21:local docker/control
 ```
 
-This retains the existing CI tools, adds JDK 21 and Graphviz, and selects JDK 21
+This retains the existing CI tools, adds JDK 21, Graphviz and git, and selects JDK 21
 in the login shell used by the runner. `BASE_IMAGE` can override the CI base.
 This Dockerfile targets the retained Debian 9 CI base; `BASE_IMAGE` may also
 pin that base by digest. The node images and TiDB/TiKV/PD binaries do not require
@@ -56,8 +56,11 @@ in the checker, as it was at the fork head.
 ## Adaptations
 
 - Append and transactional register workloads use Elle models. RC selects
-  `:read-committed`; RR selects `:strong-snapshot-isolation`, retaining the old
-  realtime ordering checks while adding G1 checks and allowing SI write skew.
+  `:read-committed` plus `:G1c-realtime`; RR selects `:snapshot-isolation`
+  plus `:G1c-realtime` and `:G-single-realtime`. These retain the old realtime constraints while
+  adding G1/full SI checks, without silently requiring the stronger strong-SI
+  model. Real local testing found a history rejected only by strong SI; that
+  history is retained separately for further investigation.
 - A small wrapper eagerly builds history pair indices to avoid Elle 0.2.7's
   known sparse-history deadlock. It can be removed after adopting a release
   containing Elle commit `fa0e699ec3488b9dfc660be4fcf7e9547bbea4e0`.
@@ -70,6 +73,11 @@ in the checker, as it was at the fork head.
 - PD leader discovery runs in the nemesis worker instead of blocking the
   central generator. PD leader partitions and interrupted restart-without-PD
   tests now have complete final recovery actions.
+- New nodes are installed without relying on the old `ls` exit code. Flat
+  archives are normalized by moving binaries into `bin`, so later data resets
+  cannot delete their symlink targets.
+- Known TiDB abort messages are classified consistently across JDBC exception
+  subclasses; timeouts and unknown outcomes remain uncertain.
 - Multitable bank diagnostics run in the checker with the completed history;
   client teardown can run before setup in the new framework.
 

@@ -132,15 +132,16 @@
      :generator (->> (gen/mix [(incs key-count)
                                (reads key-count)]))}))
 
-(defn consistency-model
-  "TiDB's REPEATABLE READ uses snapshots with real-time ordering. Preserve
-  the old checker's realtime edges while asking Elle to include all SI
-  anomalies, including G1. Strong SI still permits concurrent write skew;
-  the default strict-serializable model would incorrectly reject it."
+(defn consistency-options
+  "Check the SQL isolation level and retain the old checker's realtime
+  constraints. SI plus G-single-realtime is weaker than strong SI, which
+  would introduce additional requirements beyond the original workload."
   [opts]
   (case (util/isolation-level opts)
-    :read-committed :read-committed
-    :repeatable-read :strong-snapshot-isolation))
+    :read-committed {:consistency-models [:read-committed]
+                     :anomalies [:G1c-realtime]}
+    :repeatable-read {:consistency-models [:snapshot-isolation]
+                      :anomalies [:G1c-realtime :G-single-realtime]}))
 
 (defn indexed-checker
   "Precompute the history index before Elle starts concurrent folds. This
@@ -154,11 +155,11 @@
 
 (defn txn-workload
   [opts]
-  (-> (wr/test {:min-txn-length 2
-                 :max-txn-length 5
-                 :key-count 5
-                 :max-writes-per-key 32
-                 :consistency-models [(consistency-model opts)]})
+  (-> (wr/test (merge {:min-txn-length 2
+                        :max-txn-length 5
+                        :key-count 5
+                        :max-writes-per-key 32}
+                       (consistency-options opts)))
       (assoc :client (txn/client {:val-type "int"}))
       (update :checker indexed-checker)))
 
@@ -191,10 +192,10 @@
 
 (defn append-workload
   [opts]
-  (-> (append/test {:min-txn-length 1
-                     :max-txn-length 4
-                     :key-count 5
-                     :max-writes-per-key 16
-                     :consistency-models [(consistency-model opts)]})
+  (-> (append/test (merge {:min-txn-length 1
+                            :max-txn-length 4
+                            :key-count 5
+                            :max-writes-per-key 16}
+                           (consistency-options opts)))
       (assoc :client (append-client (txn/client {:val-type "text"})))
       (update :checker indexed-checker)))

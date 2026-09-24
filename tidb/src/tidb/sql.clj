@@ -188,22 +188,18 @@
   "Deadlock found when trying to get lock; try restarting transaction")
 
 (defmacro capture-txn-abort
-  "Converts aborted transactions to an ::abort keyword"
+  "Converts known TiDB abort messages to ::abort for all JDBC subclasses."
   [& body]
   `(try ~@body
-        (catch java.sql.SQLTransactionRollbackException e#
-          (if (str/ends-with? (.getMessage e#) rollback-msg)
-            ::abort
-            (throw e#)))
-        (catch java.sql.BatchUpdateException e#
-          (if (str/ends-with? (.getMessage e#) rollback-msg)
-            ::abort
-            (throw e#)))
         (catch java.sql.SQLException e#
-          (condp re-find (.getMessage e#)
-            #"can not retry select for update statement" ::abort
-            #"\[try again later\]" ::abort
-            (throw e#)))))
+          ;; java.jdbc may wrap a single statement in BatchUpdateException.
+          ;; The database's outcome semantics do not change with that wrapper.
+          (let [message# (.getMessage e#)]
+            (if (or (str/ends-with? message# rollback-msg)
+                    (re-find #"can not retry select for update statement" message#)
+                    (re-find #"\[try again later\]" message#))
+              ::abort
+              (throw e#))))))
 
 (defmacro with-txn-retries
   "Retries body on rollbacks."

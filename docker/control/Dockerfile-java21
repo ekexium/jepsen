@@ -20,14 +20,14 @@ RUN curl -fsSL https://archive.debian.org/debian/pool/main/c/curl/libcurl3-gnutl
     && dpkg -i /tmp/libcurl.deb /tmp/apt-https.deb \
     && rm -f /tmp/libcurl.deb /tmp/apt-https.deb
 
-# Elle renders anomaly graphs with dot.
+# Elle renders anomaly graphs with dot; Jepsen startup records git metadata.
 RUN printf '%s\n' 'deb https://archive.debian.org/debian stretch main' > /tmp/jepsen-apt.list \
     && apt-get -o Dir::Etc::sourcelist=/tmp/jepsen-apt.list \
         -o Dir::Etc::sourceparts=- -o Acquire::Check-Valid-Until=false \
         -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
     && apt-get -y --no-install-recommends \
         -o Dir::Etc::sourcelist=/tmp/jepsen-apt.list -o Dir::Etc::sourceparts=- \
-        -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install graphviz \
+        -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install graphviz git \
     && rm -f /tmp/jepsen-apt.list \
     && rm -rf /var/lib/apt/lists/*
 

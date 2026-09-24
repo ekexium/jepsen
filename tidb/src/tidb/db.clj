@@ -523,13 +523,13 @@
         (let [f (cu/cached-wget! url)]
           (c/exec :tar :-xf f :-C tidb-bin-dir)))
       ; Some tarballs place binaries directly in tidb-dir instead of tidb/bin.
-      ; Ensure a consistent ./bin layout by creating symlinks when needed.
+      ; Keep executables inside bin: resetting a test deletes its siblings.
       (when (not (cu/exists? tidb-bin-dir))
         (info "Creating bin layout for TiDB tarball")
         (c/exec :mkdir :-p tidb-bin-dir)
         (doseq [b [pd-bin kv-bin db-bin pdctl-bin tikv-worker-bin]]
           (when (cu/exists? (str tidb-dir "/" b))
-            (c/exec :ln :-sf (str tidb-dir "/" b)
+            (c/exec :mv (str tidb-dir "/" b)
                     (str tidb-bin-dir "/" b)))))
       (when (:pd-services test)
         (info "Creating symbol links for PD services")
@@ -597,13 +597,11 @@
         (info node "resetting TiDB")
         (c/su
           (stop! test node)
-          (try+ (->> (cu/ls tidb-dir)
-                     (remove #{"bin"})
-                     (map (partial str tidb-dir "/"))
-                     (c/exec :rm :-rf))
-                (catch [:type :jepsen.control/nonzero-exit, :exit 2] e
-                   ; No such dir
-                  nil)))
+          (when (cu/exists? tidb-dir)
+            (->> (cu/ls tidb-dir)
+                 (remove #{"bin"})
+                 (map (partial str tidb-dir "/"))
+                 (c/exec :rm :-rf))))
         (c/su
           (install! test node)
           (configure!)
