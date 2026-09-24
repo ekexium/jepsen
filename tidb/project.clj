@@ -4,10 +4,11 @@
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :main tidb.core
-  :dependencies [[org.clojure/clojure "1.10.0"]
+  :jvm-opts ["-Djava.awt.headless=true"]
+  :dependencies [[org.clojure/clojure "1.12.6"]
                  [clj-http "3.10.0"]
                  [cheshire "5.8.1"]
-                 [org.clojars.pingcap/jepsen "0.1.15-SNAPSHOT"]
+                 [org.clojars.pingcap/jepsen "0.3.14-SNAPSHOT"]
                  [org.clojure/java.jdbc "0.7.11"]
                  [org.mariadb.jdbc/mariadb-java-client "2.4.1"]
                  [javax.xml.bind/jaxb-api "2.3.1"]

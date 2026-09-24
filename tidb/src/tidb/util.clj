@@ -1,7 +1,8 @@
 (ns tidb.util
   (:require [clojure.string :as str]
             [clj-http.client :as http]
-            [jepsen.tests.cycle :refer [DataExplainer directed-graph link]]))
+            [elle.core :refer [DataExplainer]])
+  (:import (io.lacuna.bifurcan DirectedGraph)))
 
 (defn isolation-level [test] (get test :isolation :repeatable-read))
 
@@ -51,18 +52,21 @@
     [_ {:keys [a b]} a-name b-name]
     (str a-name "'s commit-ts " (get-commit-ts a) " < " b-name "'s start-ts " (get-start-ts b))))
 
-(defn tso-graph [history]
+(defn tso-graph
+  "Builds a standalone timestamp-order graph and explainer. Workload checkers
+  do not currently use this graph."
+  [history]
   (loop [h (->> history
                 (filter #(let [start-ts (get-start-ts %)]
                            (and (pos? start-ts)
                                 (not= max-ts start-ts))))
                 (sort-by get-start-ts))
-         g (directed-graph)
+         g (DirectedGraph.)
          ops nil]
     (if-let [op (first h)]
       (let [start-ts (get-start-ts op)
             commit-ts (get-commit-ts op)
-            link-to-op (fn [g op'] (link g op' op :tso))
+            link-to-op (fn [^DirectedGraph g op'] (.link g op' op :tso))
             before-op? (fn [op'] (< (get-commit-ts op') start-ts))
             ops' (filter before-op? ops)
             implied-ts (when (seq ops') (apply max (map get-start-ts ops')))

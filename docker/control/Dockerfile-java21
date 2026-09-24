@@ -1,0 +1,35 @@
+# Keep the CI tools and shell setup while upgrading the Jepsen runtime.
+ARG BASE_IMAGE=hub.pingcap.net/qa/jepsen-control-base:250611
+FROM eclipse-temurin:21-jdk-jammy AS jdk
+FROM ${BASE_IMAGE}
+
+COPY --from=jdk /opt/java/openjdk /opt/java/openjdk
+ENV JAVA_HOME=/opt/java/openjdk
+ENV PATH=/opt/java/openjdk/bin:${PATH}
+# CI starts commands with bash -l, which resets PATH through /etc/profile.
+RUN printf '%s\n' 'export JAVA_HOME=/opt/java/openjdk' \
+        'export PATH="$JAVA_HOME/bin:$PATH"' > /etc/profile.d/jepsen-java.sh \
+    && /opt/java/openjdk/bin/java -version
+
+# The retained Debian 9 base needs its HTTPS APT transport before reading
+# the signed Debian archive. Pin the bootstrap packages and verify hashes.
+RUN curl -fsSL https://archive.debian.org/debian/pool/main/c/curl/libcurl3-gnutls_7.52.1-5+deb9u10_amd64.deb -o /tmp/libcurl.deb \
+    && curl -fsSL https://archive.debian.org/debian/pool/main/a/apt/apt-transport-https_1.4.10_amd64.deb -o /tmp/apt-https.deb \
+    && echo '79ec5b44c8fc02f01bba527dc894fba37b53805b1782969308482895cafd7b14  /tmp/libcurl.deb' | sha256sum -c - \
+    && echo '6809e29510f9dcfda5280b15f857d9b7b2413cb5c67c149780c66a4fa4e2a030  /tmp/apt-https.deb' | sha256sum -c - \
+    && dpkg -i /tmp/libcurl.deb /tmp/apt-https.deb \
+    && rm -f /tmp/libcurl.deb /tmp/apt-https.deb
+
+# Elle renders anomaly graphs with dot.
+RUN printf '%s\n' 'deb https://archive.debian.org/debian stretch main' > /tmp/jepsen-apt.list \
+    && apt-get -o Dir::Etc::sourcelist=/tmp/jepsen-apt.list \
+        -o Dir::Etc::sourceparts=- -o Acquire::Check-Valid-Until=false \
+        -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
+    && apt-get -y --no-install-recommends \
+        -o Dir::Etc::sourcelist=/tmp/jepsen-apt.list -o Dir::Etc::sourceparts=- \
+        -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install graphviz \
+    && rm -f /tmp/jepsen-apt.list \
+    && rm -rf /var/lib/apt/lists/*
+
+# Apply to the runner's plain java commands as well as interactive shells.
+ENV JAVA_TOOL_OPTIONS=-Djava.awt.headless=true

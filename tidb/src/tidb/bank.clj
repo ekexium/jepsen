@@ -139,9 +139,6 @@
   (assoc (bank/test)
          :client (BankClient. nil (atom false))))
 
-(defn cal-sum-total [history]
-  (apply + (vals (:value (last (filter #(and (= :ok (:type %)) (= :read (:f %))) history))))))
-
 ; One bank account per table
 (defrecord MultiBankClient [conn tbl-created?]
   client/Client
@@ -217,25 +214,28 @@
                           (c/update! c to {:balance b2} ["id = 0"])
                           (assoc op :type :ok :value (transfer_value from to b1 b2 amount))))))))))
 
-  (teardown! [_ test]
-    ; FIXME: fix hard-code node name 'n1'
-    (if (and (= "n1" (:tidb.sql/node conn)) (not= 100 (cal-sum-total @(:history test))))
-      (try
-        (do
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts0/0"))
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts1/0"))
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts2/0"))
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts3/0"))
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts4/0"))
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts5/0"))
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts6/0"))
-          (info (slurp "http://n1:10080/mvcc/key/test/accounts7/0")))
-        (catch RuntimeException e))))
+  (teardown! [_ test])
 
   (close! [_ test]
     (c/close! conn)))
 
+(defn multitable-checker
+  "Collects MVCC diagnostics after checking the completed multitable history."
+  [base-checker]
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [result (checker/check base-checker test history opts)]
+        (when (false? (:valid? result))
+          (doseq [account (:accounts test)]
+            (try
+              (info (slurp (str "http://" (name (first (:nodes test)))
+                                ":10080/mvcc/key/test/accounts" account "/0")))
+              (catch Exception e
+                (warn e "Could not collect bank MVCC diagnostics")))))
+        result))))
+
 (defn multitable-workload
   [opts]
-  (assoc (workload opts)
-         :client (MultiBankClient. nil (atom false))))
+  (-> (workload opts)
+      (assoc :client (MultiBankClient. nil (atom false)))
+      (update-in [:checker :checkers :SI] multitable-checker)))

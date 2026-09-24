@@ -86,8 +86,7 @@
 (defn adds
   []
   (->> (range)
-       (map (fn [x] {:type :invoke, :f :add, :value x}))
-       (gen/seq)))
+       (map (fn [x] {:type :invoke, :f :add, :value x}))))
 
 (defn reads
   []
@@ -97,7 +96,7 @@
   [opts]
   (let [c (:concurrency opts)]
     {:client (SetClient. nil)
-     :generator (->> (gen/reserve (/ c 2) (adds) (reads))
+     :generator (->> (gen/reserve (quot (inc c) 2) (adds) (gen/repeat (reads)))
                      (gen/stagger 1/10))
      :checker (checker/set-full)}))
 

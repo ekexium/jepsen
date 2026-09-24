@@ -1,7 +1,7 @@
 (ns tidb.core
   "Runs TiDB tests. Provides exit status reporting."
   (:gen-class)
-  (:refer-clojure :exclude [test])
+  (:refer-clojure :exclude [test parse-long])
   (:require [clojure.pprint :refer [pprint]]
             [clojure.tools.logging :refer :all]
             [clojure.string :as str]
@@ -371,17 +371,19 @@
         gen       (->> (:generator workload)
                        (gen/nemesis (:generator nemesis))
                        (gen/time-limit (:time-limit opts)))
+        gen       (gen/phases gen
+                              (gen/log "Healing cluster")
+                              (gen/nemesis (:final-generator nemesis)))
         gen       (if (:final-generator workload)
                     (gen/phases gen
-                                (gen/log "Healing cluster")
-                                (gen/nemesis (:final-generator nemesis))
                                 (gen/log "Waiting for recovery")
-                                (gen/sleep (:final-recovery-time opts))
+                                (gen/sleep (:recovery-time opts 10))
                                 (gen/clients (:final-generator workload)))
-                    gen)]
+                    gen)
+        gen       ((:wrap-generator workload identity) gen)]
     (merge tests/noop-test
            opts
-           (dissoc workload :final-generator)
+           (dissoc workload :final-generator :wrap-generator)
            {:name       name
             :db         (db/db)
             :client     (:client workload)

@@ -143,6 +143,8 @@
        (:type op)            \tab
        (pr-str (:f op))      \tab
        (pr-str (:value op))
+       (when-let [txn (:txn-info op)]
+         (str \tab txn))
        (when-let [err (:error op)]
          (str \tab err))))
 
@@ -153,6 +155,8 @@
   (pr (:type op))    (print \tab)
   (pr (:f op))       (print \tab)
   (pr (:value op))
+  (when-let [txn (:txn-info op)]
+    (print \tab) (print txn))
   (when-let [err (:error op)]
     (print \tab) (print err))
   (print \newline))

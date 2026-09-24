@@ -120,38 +120,35 @@
          :bad         bad}))))
 
 (defn writes
-  "We emit sequential integer keys for writes, logging the most recent n keys
-  in the given atom, wrapping a PersistentQueue."
-  [last-written]
-  (let [k (atom -1)]
-    (reify gen/Generator
-      (op [this test process]
-        (let [k (swap! k inc)]
-          (swap! last-written #(-> % pop (conj k)))
-          {:type :invoke, :f :write, :value k})))))
+  "Emit distinct keys. The sequence advances only when an op is consumed."
+  []
+  (map (fn [k] {:type :invoke, :f :write, :value k}) (range)))
 
 (defn reads
-  "We use the last-written atom to perform a read of a randomly selected
-  recently written value."
-  [last-written]
-  (gen/filter (comp complement nil? :value)
-              (reify gen/Generator
-                (op [this test process]
-                  {:type :invoke, :f :read, :value (rand-nth @last-written)}))))
+  "Read a recently invoked write, waiting until at least one exists."
+  []
+  (reify gen/Generator
+    (op [this test ctx]
+      (if-let [ks (seq (::recent-writes ctx))]
+        [(gen/fill-in-op {:f :read, :value (rand-nth (vec ks))} ctx) this]
+        [:pending this]))
+    (update [this test ctx event] this)))
 
 (defn gen
-  "Basic generator with n writers, and a buffer of 2n"
+  "Basic generator with n writers, tracking their last 2n invoked keys."
   [n]
-  (let [last-written (atom
-                      (reduce conj clojure.lang.PersistentQueue/EMPTY
-                              (repeat (* 2 n) nil)))]
-    (gen/reserve n (writes last-written)
-                 (reads last-written))))
+  (gen/track ::recent-writes clojure.lang.PersistentQueue/EMPTY
+             (fn [ks op]
+               (if (and (= :invoke (:type op)) (= :write (:f op)))
+                 (conj (if (= (* 2 n) (count ks)) (pop ks) ks)
+                       (:value op))
+                 ks))
+             (gen/reserve n (writes) (reads))))
 
 (defn workload
   [opts]
   (let [c         (:concurrency opts)
-        gen       (gen (/ c 2))
+        gen       (gen (quot (inc c) 2))
         keyrange (atom {})]
       {:key-count 5
        :keyrange  keyrange

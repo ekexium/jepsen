@@ -10,12 +10,18 @@ the consistency properties defined in each test.  During the tests,
 various combinations of nemeses can be added to interfere with the
 database operations and exercise the database's consistency protocols.
 
+## Build requirements
+
+This version uses Jepsen 0.3.14 and Elle 0.2.7. It requires JDK 21 or newer.
+See [the upstream migration notes](doc/upstream-migration.md) for the local
+framework build, Java 21 CI image, preserved fork features, and validation.
+
 ## Running
 
 To run a single test, try
 
 ```
-lein run test --workload sets --nemesis kill --time-limit 60 --test-count 1 --concurrency 2n
+lein run test --workload set --nemesis kill --time-limit 60 --test-count 1 --concurrency 2n
 ```
 
 To run the full suite, use

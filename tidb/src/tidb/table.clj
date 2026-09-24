@@ -13,7 +13,7 @@
             [tidb.basic :as basic]
             [clojure.tools.logging :refer :all]))
 
-(defrecord TableClient [conn last-created-table]
+(defrecord TableClient [conn]
   client/Client
   (open! [this test node]
     (assoc this :conn (c/open node test)))
@@ -26,10 +26,6 @@
       (do (c/execute! conn [(str "create table if not exists t"
                                  (:value op)
                                  " (id int not null primary key, val int)")])
-          (swap! last-created-table (fn [x x'] (if (nil? x)
-                                                 x'
-                                                 (max x x')))
-                 (:value op))
           (assoc op :type :ok))
 
       :insert
@@ -55,17 +51,31 @@
   "A generator for two operations: creating a table, and inserting a value into
   it."
   [table-id]
-  (gen/seq [{:type :invoke, :f :create-table, :value table-id}
-            {:type :invoke, :f :insert, :value [table-id 0]}]))
+  [{:type :invoke, :f :create-table, :value table-id}
+   {:type :invoke, :f :insert, :value [table-id 0]}])
+
+(defrecord TableGenerator [next-table last-created-table]
+  gen/Generator
+  (op [this test ctx]
+    (let [insert? (and last-created-table (< (rand) 0.8))
+          op (gen/fill-in-op
+               (if insert?
+                 {:f :insert, :value [last-created-table 0]}
+                 {:f :create-table, :value next-table})
+               ctx)]
+      [op (if (or insert? (= :pending op))
+            this
+            (assoc this :next-table (inc next-table)))]))
+  (update [this test ctx event]
+    (if (and (= :ok (:type event)) (= :create-table (:f event)))
+      (assoc this :last-created-table
+             (max (or last-created-table 0) (:value event)))
+      this)))
 
 (defn generator
-  "Repeatedly create and insert into new tables."
-  [last-created-table]
-  (let [next-create (atom 0)]
-    (fn gen [_ _]
-      (if (and (< (rand) 0.8) @last-created-table)
-        {:type :invoke, :f :insert,       :value [@last-created-table 0]}
-        {:type :invoke, :f :create-table, :value (swap! next-create inc)}))))
+  "Create fresh tables and insert only into tables whose creation succeeded."
+  []
+  (TableGenerator. 1 nil))
 
 (defn checker
   []
@@ -78,7 +88,6 @@
 
 (defn workload
   [opts]
-  (let [last-created-table (atom nil)]
-    {:client    (TableClient. nil last-created-table)
-     :generator (generator last-created-table)
-     :checker   (checker)}))
+  {:client    (TableClient. nil)
+   :generator (generator)
+   :checker   (checker)})

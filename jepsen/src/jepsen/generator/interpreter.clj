@@ -120,10 +120,14 @@
     :in       A Queue which delivers invocations to the worker"
   [test ^ArrayBlockingQueue out worker id]
   (let [in          (ArrayBlockingQueue. 1)
+        nodes       (:nodes test)
+        node        (when (and (integer? id) (seq nodes))
+                      (nth nodes (mod id (count nodes))))
         fut
         (future
           (util/with-thread-name (str "jepsen worker "
-                                      (util/name+ id))
+                                      (util/name+ id)
+                                      (when node (str "-" (name node))))
             (let [worker (open worker test id)]
               (try
                 (loop []

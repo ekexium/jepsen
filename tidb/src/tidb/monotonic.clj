@@ -6,12 +6,15 @@
   key y decrease."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info]]
+            [elle.core :as elle]
             [jepsen [client :as client]
                     [checker :as checker]
-                    [generator :as gen]]
+                    [generator :as gen]
+                    [history :as h]]
             [jepsen.checker.timeline :as timeline]
             [jepsen.tests.cycle :as cycle]
             [jepsen.tests.cycle.append :as append]
+            [jepsen.tests.cycle.wr :as wr]
             [tidb [sql :as c :refer :all]
                   [txn :as txn]
                   [util :as util]]
@@ -123,67 +126,41 @@
     {:client (IncrementClient. nil)
      :checker (checker/compose
                 {:cycle (cycle/checker
-                          (cycle/combine cycle/monotonic-key-graph
-                                         cycle/realtime-graph))
+                          (elle/combine elle/monotonic-key-graph
+                                        elle/realtime-graph))
                  :timeline (timeline/html)})
      :generator (->> (gen/mix [(incs key-count)
                                (reads key-count)]))}))
 
-(defn wr-txns
-  "A lazy sequence of write and read transactions over a pool of n numeric
-  keys; every write is unique per key. Options:
+(defn consistency-model
+  "TiDB's REPEATABLE READ uses snapshots with real-time ordering. Preserve
+  the old checker's realtime edges while asking Elle to include all SI
+  anomalies, including G1. Strong SI still permits concurrent write skew;
+  the default strict-serializable model would incorrectly reject it."
+  [opts]
+  (case (util/isolation-level opts)
+    :read-committed :read-committed
+    :repeatable-read :strong-snapshot-isolation))
 
-    :key-count            Number of distinct keys
-    :min-txn-length       Minimum number of operations per txn
-    :max-txn-length       Maximum number of operations per txn
-    :max-writes-per-key   Maximum number of operations per key"
-  ([opts]
-   (wr-txns opts {:active-keys (vec (range (:key-count opts 5)))}))
-  ([opts state]
-   (lazy-seq
-     (let [min-length           (:min-txn-length opts 0)
-           max-length           (:max-txn-length opts 2)
-           max-writes-per-key   (:max-writes-per-key opts 32)
-           key-count            (:key-count opts 2)
-           length               (+ min-length (rand-int (- (inc max-length)
-                                                           min-length)))
-           [txn state] (loop [length  length
-                              txn     []
-                              state   state]
-                         (let [active-keys (:active-keys state)]
-                           (if (zero? length)
-                             ; All done!
-                             [txn state]
-                             ; Add an op
-                             (let [f (rand-nth [:r :w])
-                                   k (rand-nth active-keys)
-                                   v (when (= f :w) (get state k 1))]
-                               (if (and (= :w f)
-                                        (< max-writes-per-key v))
-                                 ; We've updated this key too many times!
-                                 (let [i  (.indexOf active-keys k)
-                                       k' (inc (reduce max active-keys))
-                                       state' (update state :active-keys
-                                                      assoc i k')]
-                                   (recur length txn state'))
-                                 ; Key is valid, OK
-                                 (let [state' (if (= f :w)
-                                                (assoc state k (inc v))
-                                                state)]
-                                   (recur (dec length)
-                                          (conj txn [f k v])
-                                          state')))))))]
-       (cons txn (wr-txns opts state))))))
+(defn indexed-checker
+  "Precompute the history index before Elle starts concurrent folds. This
+  avoids Elle 0.2.7's deadlock on valid sparse histories; remove after upgrading
+  to a release containing jepsen-io/elle commit fa0e699ec3488b9dfc660be4fcf7e9547bbea4e0."
+  [c]
+  (reify checker/Checker
+    (check [_ test history opts]
+      (h/ensure-pair-index history)
+      (checker/check c test history opts))))
 
 (defn txn-workload
   [opts]
-  {:client  (txn/client {:val-type "int"})
-   :checker (cycle/checker
-              (cycle/combine cycle/wr-graph
-                             cycle/realtime-graph))
-   :generator (->> (wr-txns {:min-txn-length 2, :max-txn-length 5})
-                   (map (fn [txn] {:type :invoke, :f :txn, :value txn}))
-                   gen/seq)})
+  (-> (wr/test {:min-txn-length 2
+                 :max-txn-length 5
+                 :key-count 5
+                 :max-writes-per-key 32
+                 :consistency-models [(consistency-model opts)]})
+      (assoc :client (txn/client {:val-type "int"}))
+      (update :checker indexed-checker)))
 
 (defn append-client
   "Wraps a TxnClient, translating string lists back into integers."
@@ -212,22 +189,12 @@
     (close! [this test]
       (client/close! client test))))
 
-(defn append-txns
-  "Like wr-txns, we just rewrite writes to be appends."
-  [opts]
-  (->> (wr-txns opts)
-       (map (partial mapv (fn [[f k v]] [(case f :w :append f) k v])))))
-
 (defn append-workload
   [opts]
-  {:client (append-client (txn/client {:val-type "text"}))
-   :generator (->> (append-txns {:min-txn-length      1
-                                 :max-txn-length      4
-                                 :key-count           5
-                                 :max-writes-per-key  16})
-                   (map (fn [txn] {:type :invoke, :f :txn, :value txn}))
-                   gen/seq)
-   :checker (append/checker {:anomalies         [(if (= :read-committed (:isolation opts)) :G1 :G-single)]
-                             ; Jepsen may raise an IllegalStateException("Don't know how to classify") if a cycle only
-                             ; consists of realtime edges and tso edges, which is typically caused by wrong tso info.
-                             :additional-graphs [cycle/realtime-graph]})})
+  (-> (append/test {:min-txn-length 1
+                     :max-txn-length 4
+                     :key-count 5
+                     :max-writes-per-key 16
+                     :consistency-models [(consistency-model opts)]})
+      (assoc :client (append-client (txn/client {:val-type "text"})))
+      (update :checker indexed-checker)))

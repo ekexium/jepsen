@@ -15,7 +15,7 @@
             [tidb.db :as db]
             [tidb.util :as tu]
             [clojure.tools.logging :refer :all]
-            [slingshot.slingshot :refer [try+ throw+]]))
+            [clj-commons.slingshot :refer [try+ throw+]]))
 
 (defn process-nemesis
   "A nemesis that can pause, resume, start, stop, and kill tidb, tikv, tikv-worker, and pd."
@@ -228,6 +228,30 @@
 ;
 ;     (teardown! [this test])))
 
+(defn partition-nemesis
+  "Resolves the PD leader when applying a partition. HTTP discovery belongs in
+  the nemesis worker: blocking the generator would also stall all clients."
+  []
+  (let [partitioner (nemesis/partitioner nil)]
+    (reify nemesis/Nemesis
+      (setup! [this test]
+        (nemesis/setup! partitioner test)
+        this)
+
+      (invoke! [_ test op]
+        (let [op (if (and (= :start (:f op))
+                          (= :pd-leader (:partition-type op)))
+                   (let [leader (db/await-http
+                                  (db/pd-leader-node test (rand-nth (:nodes test))))
+                         followers (remove #{leader} (:nodes test))]
+                     (assoc op :value
+                            (nemesis/complete-grudge [[leader] followers])))
+                   op)]
+          (nemesis/invoke! partitioner test op)))
+
+      (teardown! [_ test]
+        (nemesis/teardown! partitioner test)))))
+
 (defn full-nemesis
   "Merges together all nemeses"
   [n]
@@ -244,7 +268,7 @@
      #{:start-netem :stop-netem} (netem-nemesis (:netem-type n netem-noop))
      ; #{:slow-primary}                       (slow-primary-nemesis)
      {:start-partition :start
-      :stop-partition  :stop}               (nemesis/partitioner nil)
+      :stop-partition  :stop}               (partition-nemesis)
      ; {:reset-clock          :reset
      ;  :strobe-clock         :strobe
      ;  :check-clock-offsets  :check-offsets
@@ -275,33 +299,26 @@
 
 (defn partition-one-gen
   "A generator for a partition that isolates one node."
-  [test process]
+  [test _ctx]
   (op :start-partition
      (->> test :nodes nemesis/split-one nemesis/complete-grudge)
      :partition-type :single-node))
 
 (defn partition-pd-leader-gen
-  "A generator for a partition that isolates the current PD leader in a
-  minority."
-  [test process]
-  (let [leader (db/await-http
-                 (db/pd-leader-node test (rand-nth (:nodes test))))
-        followers (shuffle (remove #{leader} (:nodes test)))
-        nodes       (cons leader followers)
-        components  (split-at 1 nodes) ; Maybe later rand(n/2+1?)
-        grudge      (nemesis/complete-grudge components)]
-    (op :start-partition, grudge, :partition-type :pd-leader)))
+  "Requests a partition around the PD leader, discovered at invocation time."
+  [_test _ctx]
+  (op :start-partition nil :partition-type :pd-leader))
 
 (defn partition-half-gen
   "A generator for a partition that cuts the network in half."
-  [test process]
+  [test _ctx]
   (op :start-partition
       (->> test :nodes shuffle nemesis/bisect nemesis/complete-grudge)
       :partition-type :half))
 
 (defn partition-ring-gen
   "A generator for a partition that creates overlapping majority rings"
-  [test process]
+  [test _ctx]
   (op :start-partition
       (->> test :nodes nemesis/majorities-ring)
       :partition-type :ring))
@@ -318,7 +335,7 @@
 (defn flip-flop
   "Switches between ops from two generators: a, b, a, b, ..."
   [a b]
-  (gen/seq (cycle [a b])))
+  (gen/flip-flop (gen/cycle a) (gen/cycle b)))
 
 (defn opt-mix
   "Given a nemesis map n, and a map of options to generators to use if that
@@ -332,7 +349,7 @@
                      []
                      possible-gens)]
     (when (seq gens)
-      (gen/mix gens))))
+      (gen/mix (map gen/repeat gens)))))
 
 (defn mixed-generator
   "Takes a nemesis options map `n`, and constructs a generator for all nemesis
@@ -392,11 +409,12 @@
          ; For all options relevant for this nemesis, mix them together
          (remove nil?)
          gen/mix
-         ; Introduce either random or fixed delays between ops
+         ; Preserve the old uniform 0..2*interval random schedule. Upstream
+         ; stagger now uses an exponential distribution by default.
          ((case (:schedule n)
-            (nil :random)    gen/stagger
-            :fixed           gen/delay-til)
-          (:interval n)))))
+            (nil :random) (partial gen/stagger-nanos
+                                    #(long (rand (* 2e9 (:interval n)))))
+            :fixed        (partial gen/delay (:interval n)))))))
 
 (defn final-generator
   "Takes a nemesis options map `n`, and constructs a generator to stop all
@@ -404,6 +422,7 @@
   operations."
   [n]
   (->> (cond-> []
+         (:restart-kv-without-pd n) (into [:resume-pd :start-kv])
          ; (:clock-skew n)      (conj :reset-clock)
          (:pause-pd n)          (conj :resume-pd)
          (:pause-kv n)          (conj :resume-kv)
@@ -424,22 +443,22 @@
 
          (:enable-failpoint n)
          (conj :disable-failpoint)
-         (some n [:partition-one :partition-half :partition-ring])
+         (some n [:partition-one :partition-pd-leader
+                  :partition-half :partition-ring])
          (conj :stop-partition))
-       (map op)
-       gen/seq))
+       (map op)))
 
 (defn restart-kv-without-pd-generator
   "A special generator which pauses all PD nodes, restarts all KV nodes, waits
   a bit, and unpauses PD; the cluster should recover, but a finite retry loop
   causes it to fail."
   []
-  (gen/seq [(gen/sleep 10)
-            (fn [test _] {:type :info, :f :kill-kv,  :value (:nodes test)})
-            (fn [test _] {:type :info, :f :pause-pd, :value (:nodes test)})
-            (op :start-kv)
-            (gen/sleep 70)
-            (op :resume-pd)]))
+  [(gen/sleep 10)
+   (gen/once (fn [test _] (op :kill-kv (:nodes test))))
+   (gen/once (fn [test _] (op :pause-pd (:nodes test))))
+   (op :start-kv)
+   (gen/sleep 70)
+   (op :resume-pd)])
 
 ; (defn slow-primary-generator
 ;   "A special generator which tries to create a situation in which a primary,
@@ -478,11 +497,12 @@
         ; (slow-primary-generator)
 
         (:long-recovery n)
-        (let [mix     #(gen/time-limit 120 (mixed-generator n))
-              recover #(gen/phases (final-generator n)
-                                   (gen/sleep 60))]
-          (gen/seq-all (interleave (repeatedly mix)
-                                   (repeatedly recover))))
+        ; Functions produce a fresh generator after the preceding one is
+        ; exhausted. Each recovery completes before its quiet window starts.
+        (fn []
+          (gen/phases (gen/time-limit 120 (mixed-generator n))
+                      (final-generator n)
+                      (gen/sleep 60)))
 
         true
         (mixed-generator n)))

@@ -20,3 +20,16 @@
     (testing "Jepsen Fipp pprint"
       (is (= "{:index 0, :time 1, :type :ok, :process 2, :f :read, :value \"hi\"}\n"
              (with-out-str (p/pprint op)))))))
+
+
+(deftest op-transaction-info-test
+  (let [op (h/op {:index 0, :time 1, :process 2, :type :ok, :f :txn,
+                  :value [[:append 0 7]],
+                  :txn-info {:start_ts 100, :commit_ts 110},
+                  :error :connection-lost})]
+    (doseq [rendered [(p/op->str op) (with-out-str (p/prn-op op))]]
+      (is (re-find #":start_ts 100" rendered))
+      (is (re-find #":commit_ts 110" rendered))
+      (is (re-find #"connection-lost" rendered)))
+    (is (= "2\t:ok\t:txn\t[[:append 0 7]]"
+           (p/op->str (dissoc op :txn-info :error))))))
