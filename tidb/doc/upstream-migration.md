@@ -1,8 +1,10 @@
 # Jepsen 0.3.14 integration
 
-This branch replays PingCAP's `testing_ci` changes from `b778e6ff` on
-upstream Jepsen `v0.3.14` (`e5c458ad`). The framework remains published under
-`org.clojars.pingcap/jepsen`, now at `0.3.14-SNAPSHOT`, and uses Elle 0.2.7.
+This branch merges upstream Jepsen `v0.3.14` (`e5c458ad`) into PingCAP's
+`testing_ci` at `b778e6ff`, preserving both histories. Its integration and
+compatibility changes reproduce the locally validated rebase at `2de6277a`.
+The framework retains the `org.clojars.pingcap/jepsen` coordinate, now at
+`0.3.14-SNAPSHOT`, and uses Elle 0.2.7; build it locally as shown below.
 
 ## Build and runtime
 
