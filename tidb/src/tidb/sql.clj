@@ -194,7 +194,7 @@
         (catch java.sql.SQLException e#
           ;; java.jdbc may wrap a single statement in BatchUpdateException.
           ;; The database's outcome semantics do not change with that wrapper.
-          (let [message# (.getMessage e#)]
+          (let [message# (or (.getMessage e#) "")]
             (if (or (str/ends-with? message# rollback-msg)
                     (re-find #"can not retry select for update statement" message#)
                     (re-find #"\[try again later\]" message#))
@@ -225,13 +225,13 @@
     (with-txn-aborts ~op ~@body)
 
     (catch java.sql.BatchUpdateException e#
-      (condp re-find (.getMessage e#)
+      (condp re-find (or (.getMessage e#) "")
         #"Query timed out" (assoc ~op :type :info, :error :query-timed-out)
         #"Division by 0" (assoc ~op :type :fail, :error :division-by-zero)
         (throw e#)))
 
     (catch java.sql.SQLNonTransientConnectionException e#
-      (condp re-find (.getMessage e#)
+      (condp re-find (or (.getMessage e#) "")
         #"Connection timed out" (assoc ~op :type :info, :error :conn-timed-out)
         (throw e#)))
 
