@@ -3,10 +3,11 @@
   (:require [jepsen.store :as store]
             [clojure.string :as str]
             [clojure.edn :as edn]
-            [clojure.java.io :as io]
+            [clojure.java [io :as io]]
             [clojure.tools.logging :refer :all]
-            [clojure.pprint :refer [pprint]]
-            [clj-time.format :as timef]
+            [clj-commons.byte-streams :as bs]
+            [fipp.edn :refer [pprint]]
+            [java-time.api :as time]
             [hiccup.core :as h]
             [ring.util.response :as response]
             [org.httpkit.server :as server])
@@ -36,37 +37,105 @@
 ; Path/File protocols
 (extend-protocol io/Coercions
   Path
-  (as-file [p] (.toFile p))
-  (as-url [p] (.toURL (.toURI p))))
+  (as-file [^Path p] (.toFile p))
+  (as-url [^Path p] (.toURL (.toUri p))))
 
 (defn url-encode-path-components
   "URL encodes *individual components* of a path, leaving / as / instead of
   encoded."
-  [x]
-  (str/replace (java.net.URLEncoder/encode x) #"%2F" "/"))
+  [^String x]
+  (str/replace (java.net.URLEncoder/encode x "UTF-8") #"%2F" "/"))
+
+(def test-cache
+  "An in-memory cache of {:name, :start-time, :valid?} maps, indexed by an
+  ordered map of [:start-time :name]. Earliest start times at the front."
+  (atom (sorted-map-by (comp - compare))))
+
+(def test-cache-key
+  "Function which extracts the key for the test cache from a map."
+  (juxt :start-time :name))
+
+(def test-cache-mutable-window
+  "How far back in the test cache do we refresh on every page load?"
+  2)
+
+(def page-limit
+  "How many test rows per page?"
+  128)
+
+(def local-offset
+  "The local offset we use for presenting times"
+  (memoize (fn [] (.getOffset ^java.time.OffsetTime (time/offset-time)))))
+
+(defn parse-time
+  "Parses a time from a string"
+  [t]
+  (time/offset-date-time t))
+
+(defn cap-str
+  "Caps a string to length n."
+  [n ^String s]
+  (let [l (.length s)]
+    (if (< n l)
+      (subs s 0 n)
+      s)))
+
+(defn cache-test!
+  "Updates the test cache with a partial map. Returns test."
+  [test]
+  ; We don't want to cache incomplete tests; they could still be being
+  ; written.
+  (when (#{true false :unknown} (:valid? (:results test)))
+    (swap! test-cache assoc (test-cache-key test)
+           {:name       (:name test)
+            :start-time (:start-time test)
+            :results    {:valid? (:valid? (:results test))}}))
+  test)
+
+(defn load-jepsen-file!
+  "Loads a test file into memory, returning the test map. As a side effect,
+  also updates the test cache."
+  [file]
+  (-> file
+      store/load-jepsen-file
+      cache-test!))
 
 (defn fast-tests
-  "Abbreviated set of tests"
+  "Abbreviated set of tests: just name, start-time, results. Memoizes
+  (partially) via test-cache."
   []
-  (->> (store/tests)
-       (mapcat (fn [[test-name runs]]
-                 (keep (fn [[test-time full-test]]
-                         (try
-                           {:name        test-name
-                            :start-time  test-time
-                            :results     (store/memoized-load-results test-name test-time)}
-                           (catch java.io.FileNotFoundException e
-                             ; Incomplete test
-                             {:name       test-name
-                              :start-time test-time
-                              :results    {:valid? :incomplete}})
-                           (catch java.lang.RuntimeException e
-                             ; Um???
-                             (warn e "Unable to parse" test-name test-time)
-                             {:name       test-name
-                              :start-time test-time
-                              :results    {:valid? :incomplete}})))
-                       runs)))))
+  (let [cached @test-cache
+        ; Drop the most recent n keys from the cache--these we assume may have
+        ; changed recently.
+        cached (->> (keys cached)
+                    (take test-cache-mutable-window)
+                    (reduce dissoc cached))]
+    (->> (for [[name runs] (store/tests)
+               [time test] runs]
+           (let [t {:name           name,
+                    :start-time     (parse-time time)}]
+             (or (get cached (test-cache-key t))
+                 ; Fetch from disk if not cached. Note that we construct a new
+                 ; map so we can release the filehandle associated with the lazy
+                 ; test map.
+                 (try
+                   (let [results {:valid? (:valid? (store/load-results
+                                                     name time)
+                                                   :incomplete)}
+                         t (-> t (assoc :results results))]
+                     (cache-test! t)
+                     t)
+                   (catch java.io.EOFException e
+                     (assoc t :results {:valid? :incomplete}))
+                   (catch java.io.FileNotFoundException e
+                     (assoc t :results {:valid? :incomplete}))
+                   (catch java.lang.RuntimeException e
+                     ; Um???
+                     (warn e "Unable to parse" (str name "/" time))
+                     (assoc t :results {:valid? :incomplete}))))))
+         (sort-by :start-time)
+         reverse
+         vec)))
 
 (defn test-header
   []
@@ -90,7 +159,7 @@
   "Takes a test and filename components; returns a URL for that file."
   [t & args]
   (url-encode-path-components
-    (str "/files/" (-> (apply store/path t args)
+    (str "/files/" (-> ^File (apply store/path t args)
                        .getPath
                        (str/replace #"\Astore/" "")
                        (str/replace #"/\Z" "")))))
@@ -105,10 +174,9 @@
   "Turns a test map into a table row."
   [t]
   (let [r    (:results t)
-        time (->> t
-                  :start-time
-                  (timef/parse   (timef/formatters :basic-date-time))
-                  (timef/unparse (timef/formatters :date-hour-minute-second)))]
+        time (as-> (:start-time t) t
+               (time/with-offset-same-instant t (local-offset))
+               (time/format "YYYY-MM-dd HH:mm:ss" t))]
     [:tr
      [:td [:a {:href (url t "")} (:name t)]]
      [:td [:a {:href (url t "")} time]]
@@ -119,19 +187,46 @@
      [:td [:a {:href (url t "jepsen.log")}     "jepsen.log"]]
      [:td [:a {:href (str (url t) ".zip")} "zip"]]]))
 
+(defn params
+  "Parses a query params map from a request."
+  [req]
+  (when-let [q (:query-string req)]
+    (->> (str/split q #"&")
+         (keep (fn [pair]
+                 (when (not= "" pair)
+                   (let [[k v] (str/split pair #"=")]
+                     [(keyword k) v]))))
+         (into {}))))
+
 (defn home
   "Home page"
   [req]
-  {:status 200
-   :headers {"Content-Type" "text/html"}
-   :body (h/html [:h1 "Jepsen"]
-                 [:table {:cellspacing 3
-                          :cellpadding 3}
-                  [:thead (test-header)]
-                  [:tbody (->> (fast-tests)
-                               (sort-by :start-time)
-                               reverse
-                               (map test-row))]])})
+  (let [params (params req)
+        after (if-let [a (:after params)]
+                (parse-time a)
+                ; In the year three thousaaaaaand
+                (parse-time "3000-01-01T00:00:00Z"))
+        tests (->> (fast-tests)
+                   (drop-while (fn [t]
+                                 (->> (:start-time t)
+                                      (time/after? after)
+                                      not))))
+        more? (< page-limit (count tests))
+        tests (take page-limit tests)]
+    {:status 200
+     :headers {"Content-Type" "text/html"}
+     :body (h/html
+             [:h1 "Jepsen"]
+             [:table {:cellspacing 3
+                      :cellpadding 3}
+              [:thead (test-header)]
+              [:tbody (map test-row tests)]]
+             (when more?
+               [:p [:a {:href (str "/?after="
+                                   (->> (last tests)
+                                        :start-time
+                                        (time/format :iso-offset-date-time)))}
+                    "Older tests..."]]))}))
 
 (defn dir-cell
   "Renders a File (a directory) for a directory view."
@@ -139,21 +234,25 @@
   (let [results-file  (io/file f "results.edn")
         valid?        (try (with-open [r (java.io.PushbackReader.
                                            (io/reader results-file))]
-                             (:valid? (clojure.edn/read r)))
+                             (:valid?
+                               (clojure.edn/read
+                                 {:default vector}
+                                 r)))
                            (catch java.io.FileNotFoundException e
                              nil)
                            (catch RuntimeException e
+                             (info e :caught)
                              :unknown))]
-  [:a {:href (file-url f)
-       :style "text-decoration: none;
-              color: #000;"}
-   [:div {:style (str "background: " (valid-color valid?) ";\n"
-                      "display: inline-block;
-                      margin: 10px;
-                      padding: 10px;
-                      overflow: hidden;
-                      width: 280px;")}
-    (.getName f)]]))
+    [:a {:href (file-url f)
+         :style "text-decoration: none;
+                color: #000;"}
+     [:div {:style (str "background: " (valid-color valid?) ";\n"
+                        "display: inline-block;
+                        margin: 10px;
+                        padding: 10px;
+                        overflow: hidden;
+                        width: 280px;")}
+      (.getName f)]]))
 
 (defn file-cell
   "Renders a File for a directory view."
@@ -168,6 +267,14 @@
          :style "text-decoration: none;
                  color: #555;"}
      (cond
+       (re-find #"\.jepsen$" (.getName f))
+       [:pre
+        (->> (dissoc (load-jepsen-file! f) :results :history)
+          (into (sorted-map))
+          pprint
+          with-out-str
+          (cap-str 4096))]
+
        (re-find #"\.(png|jpg|jpeg|gif)$" (.getName f))
        [:img {:src (file-url f)
               :title (.getName f)
@@ -194,30 +301,64 @@
   else alphanumerically."
   [files]
   (if (every? (fn [^File f] (re-find #"^\d+$" (.getName f))) files)
-    (sort-by #(Long/parseLong (.getName %)) files)
+    (sort-by #(Long/parseLong (.getName ^File %)) files)
     (sort files)))
+
+(defn js-escape
+  "Escape a Javascript string."
+  [s]
+  (-> s
+      (str/replace "\\" "\\\\")
+      (str/replace "'" "\\x27")
+      (str/replace "\"" "\\x22")))
+
+(defn clj-escape
+  "Escape a Clojure string."
+  [s]
+  (-> (str/escape s {\" "\\\""
+                     \\ "\\\\"})))
+
+(defn file-breadcrumbs
+  "A hiccup structure for the breadcrumbs to a File."
+  [^File file]
+  (->> file
+       (.toPath)
+       (iterate #(.getParent ^Path %))
+       (take-while #(-> store/base-dir
+                        io/file
+                        .getCanonicalFile
+                        .toPath
+                        (not= (.toAbsolutePath ^Path %))))
+       (drop 1)
+       reverse
+       (map (fn [^Path component]
+              [:a {:style "margin: 0 0.3em"
+                   :href (file-url component)}
+               (.getFileName component)]))
+       (cons [:a {:style "margin-right: 0.3em"
+                  :href  "/"}
+              "jepsen"])
+       (interpose "/")))
 
 (defn dir
   "Serves a directory."
   [^File dir]
   {:status 200
    :headers {"Content-Type" "text/html"}
-   :body (h/html (->> dir
-                      (.toPath)
-                      (iterate #(.getParent %))
-                      (take-while #(-> store/base-dir
-                                       io/file
-                                       .getCanonicalFile
-                                       .toPath
-                                       (not= (.toAbsolutePath %))))
-                      (drop 1)
-                      reverse
-                      (map (fn [^Path component]
-                             [:a {:href (file-url component)}
-                                    (.getFileName component)]))
-                      (cons [:a {:href "/"} "jepsen"])
-                      (interpose " / "))
-                 [:h1 (.getName dir)]
+   ; Breadcrumbs
+   :body (h/html (file-breadcrumbs dir)
+                 ; Title
+                 (let [path (js-escape
+                              (str \" (clj-escape (.getCanonicalPath dir)) \"))]
+                   ; You can click to copy the full local path
+                   [:h1 {:onclick (str "navigator.clipboard.writeText('"
+                                       path "')")}
+                    (.getName dir)
+                    ; Or download a zip file
+                    [:a {:style "font-size: 60%;
+                                margin-left: 0.3em;"
+                         :href (file-url (str dir ".zip"))}
+                     ".zip"]])
                  [:div
                   (->> dir
                        .listFiles
@@ -242,7 +383,7 @@
           entry   (doto (ZipEntry. relpath)
                     (.setCreationTime (FileTime/fromMillis
                                         (.lastModified file))))
-          buf   (byte-array 16384)]
+          buf   (byte-array (* 16 1024 1024))]
       (with-open [input (FileInputStream. file)]
         (.putNextEntry zipper entry)
         (loop []
@@ -253,15 +394,21 @@
               (.closeEntry zipper)))))))
   zipper)
 
-(defn zip
-  "Serves a directory as a zip file. Strips .zip off the extension."
+(defn zip-strip-dir
+  "Strips the .zip off the end of a directory."
+  [^File dir]
+  (-> dir
+      (.getCanonicalFile)
+      str
+      (str/replace #"\.zip\z" "")
+      io/file))
+
+(defn zip-java
+  "Serves a directory as a zip file, using the Java zip library. Strips .zip
+  off the extension."
   [req ^File dir]
-  (let [f (-> dir
-              (.getCanonicalFile)
-              str
-              (str/replace #"\.zip\z" "")
-              io/file)
-        pipe-in (PipedInputStream. 16384)
+  (let [f        (zip-strip-dir dir)
+        pipe-in  (PipedInputStream. (* 16 1024 1024))
         pipe-out (PipedOutputStream. pipe-in)]
     (future
       (try
@@ -275,6 +422,36 @@
     {:status  200
      :headers {"Content-Type" "application/zip"}
      :body    pipe-in}))
+
+(defn zip-shell
+  "Serves a directory as a zip file, shelling out to `zip`. This is
+  significantly faster than zip-java`, but less portable."
+  [req ^File dir]
+  (let [builder (doto (ProcessBuilder. ["/usr/bin/zip" "-r" "-" "."])
+                  (.directory (zip-strip-dir dir)))
+        process (.start builder)]
+    (.close (.getOutputStream process))
+    ; Await process and log output
+    (future
+      (.waitFor process)
+      (let [exit (.exitValue process)]
+        (when-not (= 0 exit)
+          (warn "`zip` exited with non-zero exit" exit "in directory" (.getCanonicalPath dir) ":\n"
+                (bs/convert (.getErrorStream process) String)))))
+
+    {:status 200
+     :headers {"Content-Type" "application/zip"}
+     :body    (.getInputStream process)}))
+
+
+(defn zip
+  "Zips a directory using either zip-java or zip-shell."
+  [req dir]
+  (try
+    (zip-shell req dir)
+    (catch java.io.IOException e
+      (warn e "Error zipping directory using `zip`, falling back to JVM zip")
+      (zip-java req dir))))
 
 (defn assert-file-in-scope!
   "Throws if the given file is outside our store directory."
@@ -297,14 +474,56 @@
    "html" "text/html"
    "svg"  "image/svg+xml"})
 
+(defn jepsen-file
+  "Serves a request for a /test.jepsen file. We render a nice page for these."
+  [^File file]
+  (let [test (load-jepsen-file! file)
+        res {:status 200
+             :headers {"Content-Type" "text/html"}
+             ; Breadcrumbs
+             :body
+             (h/html
+               (file-breadcrumbs file)
+               ; Title
+               (let [path (js-escape
+                            (str \" (clj-escape (.getCanonicalPath file)) \"))]
+                 ; You can click to copy the full local path
+                 [:h1 {:onclick (str "navigator.clipboard.writeText('"
+                                     path "')")}
+                  (.getName file)
+                  ; Or download the Jepsen file
+                  [:a {:style "font-size: 60%;
+                              margin-left: 0.3em;"
+                       :href (str (file-url file) "?download=true")}
+                   "download"]])
+               [:div
+                [:pre
+                 (->> ; These are likely to be enormous, and we have them as
+                      ; separate files
+                      (assoc test :results '..., :history '...)
+                      (into (sorted-map))
+                      pprint
+                      with-out-str)]])}]
+    res))
+
 (defn files
   "Serve requests for /files/ urls"
   [req]
   (let [pathname ((re-find #"^/files/(.+)\z" (:uri req)) 1)
         ext      (when-let [m (re-find #"\.(\w+)\z" pathname)] (m 1))
-        f    (File. store/base-dir pathname)]
+        f        (File. store/base-dir ^String pathname)]
     (assert-file-in-scope! f)
     (cond
+      ; Test.jepsen is special
+      (= "test.jepsen" (.getName f))
+      (if (= "download=true" (:query-string req))
+        (response/file-response pathname
+                                {:root store/base-dir
+                                 :index-files? false
+                                 :allow-symlinks? false})
+        (jepsen-file f))
+
+      ; Regular files
       (.isFile f)
       (let [res (response/file-response pathname
                                         {:root             store/base-dir
@@ -316,18 +535,22 @@
                 (response/charset "utf-8"))
             res))
 
+      ; Anything can be a .zip if you believe in yourself
       (= ext "zip")
       (zip req f)
 
+      ; Directory handler
       (.isDirectory f)
       (dir f)
 
+      ; Nope!
       true
       e404)))
 
 (defn app [req]
 ;  (info :req (with-out-str (pprint req)))
-  (let [req (assoc req :uri (java.net.URLDecoder/decode (:uri req) "UTF-8"))]
+  (let [req (assoc req :uri (java.net.URLDecoder/decode
+                              ^String (:uri req) "UTF-8"))]
     (condp re-find (:uri req)
       #"^/$"     (home req)
       #"^/files/" (files req)

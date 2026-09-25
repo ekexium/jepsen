@@ -44,7 +44,7 @@ safely convert crashed reads to failed reads, and improve checker performance.
     (case (:f op)
       :read  (try (let [value (-> conn
                                   (v/get "foo" {:quorum? true})
-                                  parse-long)]
+                                  parse-long-nil)]
                     (assoc op :type :ok, :value value))
                   (catch java.net.SocketTimeoutException ex
                     (assoc op :type :fail, :error :timeout)))
@@ -70,7 +70,7 @@ a little cleaner.
       (case (:f op)
         :read (let [value (-> conn
                               (v/get "foo" {:quorum? true})
-                              parse-long)]
+                              parse-long-nil)]
                 (assoc op :type :ok, :value value))
         :write (do (v/reset! conn "foo" (:value op))
                    (assoc op :type :ok))
@@ -136,13 +136,13 @@ We have a generator that emits operations on a single key, like `{:type :invoke,
                              (range)
                              (fn [k]
                                (->> (gen/mix [r w cas])
-                                    (gen/stagger 1/10)
+                                    (gen/stagger 1/50)
                                     (gen/limit 100))))
                            (gen/nemesis
-                             (gen/seq (cycle [(gen/sleep 5)
-                                              {:type :info, :f :start}
-                                              (gen/sleep 5)
-                                              {:type :info, :f :stop}])))
+                             (cycle [(gen/sleep 5)
+                                     {:type :info, :f :start}
+                                     (gen/sleep 5)
+                                     {:type :info, :f :stop}]))
                            (gen/time-limit (:time-limit opts)))}))
 ```
 
@@ -163,7 +163,7 @@ keys.
         (case (:f op)
           :read (let [value (-> conn
                                 (v/get k {:quorum? true})
-                                parse-long)]
+                                parse-long-nil)]
                   (assoc op :type :ok, :value (independent/tuple k value)))
 
           :write (do (v/reset! conn k v)

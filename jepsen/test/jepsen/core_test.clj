@@ -1,21 +1,27 @@
 (ns jepsen.core-test
   (:refer-clojure :exclude [run!])
-  (:use jepsen.core
-        clojure.test
-        clojure.pprint
-        clojure.tools.logging)
-  (:require [clojure.string :as str]
-            [jepsen [common-test :refer [quiet-logging]]]
-            [jepsen.os :as os]
-            [jepsen.db :as db]
-            [jepsen.tests :as tst]
-            [jepsen.control :as control]
-            [jepsen.client :as client]
-            [jepsen.generator :as gen]
-            [jepsen.store :as store]
-            [jepsen.checker :as checker]
-            [jepsen.nemesis :as nemesis]
-            [knossos.model :as model]))
+  (:require [clojure [pprint :refer [pprint]]
+                     [string :as str]
+                     [test :refer :all]]
+            [dom-top.core :refer [loopr]]
+            [jepsen [checker :as checker]
+                    [client :as client]
+                    [common-test :refer [quiet-logging]]
+                    [control :as control]
+                    [core :refer :all]
+                    [db :as db]
+                    [generator :as gen]
+                    [history :as h]
+                    [nemesis :as nemesis]
+                    [nemesis-test :as nemesis-test]
+                    [os :as os]
+                    [store :as store]
+                    [tests :as tst]
+                    [util :as util]]
+            [jepsen.generator.context :as gen.ctx]
+            [jepsen.tests.cycle.append :as list-append])
+  (:import (jepsen.history IHistory
+                           Op)))
 
 (use-fixtures :once quiet-logging)
 
@@ -53,24 +59,161 @@
 
              (teardown! [this test node]))
         test (assoc tst/noop-test
+                    :pure-generators true
                     :name   "interesting exception"
                     :db     db
                     :ssh    {:dummy? true})]
     (is (thrown-with-msg? RuntimeException #"^hi$" (run! test)))))
 
+(defn list-append-test
+  "Tests a list-append workload on a simple in-memory database. Runs n ops.
+  Helpful stress & sanity test for generators, writing and reading histories,
+  and the Elle checker."
+  [n]
+  (let [state (atom {})
+        ; Takes a state, a txn, and a volatile for the completed txn to go to.
+        ; Applies txn to state, returning new state, and updating volatile.
+        apply-txn (fn apply-txn [state txn txn'-volatile]
+                    (loopr [state' (transient state)
+                            txn'  (transient [])]
+                           [[f k v :as mop] txn]
+                           (case f
+                             :r (recur state'
+                                       (conj! txn' [f k (get state' k)]))
+                             :append (recur (assoc! state' k
+                                                    (conj (get state' k []) v))
+                                            (conj! txn' mop)))
+                           (do (vreset! txn'-volatile (persistent! txn'))
+                               (persistent! state'))))
+        t1 (volatile! nil)
+        client (reify client/Client
+                 (open! [this test node] this)
+                 (setup! [this test] this)
+                 (invoke! [this test op]
+                   (let [txn' (volatile! nil)]
+                     (swap! state apply-txn (:value op) txn')
+                     (assoc op :type :ok, :value @txn')))
+                 (teardown! [this test]
+                   (vreset! t1 (System/nanoTime)))
+                 (close! [this test]))
+        test  (-> tst/noop-test
+                  (merge (list-append/test {})
+                         {:name "list-append"
+                          :client client
+                          :concurrency 100
+                          :ssh {:dummy? true}})
+                  (update :generator #(->> %
+                                           gen/clients
+                                           (gen/limit n))))
+        t0 (System/nanoTime)
+        test (run! test)
+        t1 @t1
+        t2 (System/nanoTime)
+        h (:history test)
+        r (:results test)]
+    (testing "history"
+      (is (= (* 2 n) (count h)))
+      (is (instance? IHistory h))
+      (is (instance? Op (first h))))
+    (testing "results"
+      (is (= true (:valid? r))))
+    (assoc test
+           :run-time   (double (util/nanos->secs (- t1 t0)))
+           :check-time (double (util/nanos->secs (- t2 t1))))))
+
+(deftest list-append-short-test
+  (list-append-test 100))
+
+(deftest ^:perf list-append-perf-test
+  (let [n (long 1e6)
+        {:keys [run-time check-time]} (list-append-test n)]
+    (println (format "list-append-perf-test: %d ops run in %.2f s (%.2f ops/sec); checked in %.2f s (%.2f ops/sec)"
+                     n run-time (/ n run-time)
+                     check-time (/ n check-time)))))
+
 (deftest ^:integration basic-cas-test
   (let [state (atom nil)
+        meta-log (atom [])
         db    (tst/atom-db state)
-        n     10
-        test  (run! (assoc tst/noop-test
-                           :name       "basic cas"
-                           :db         (tst/atom-db state)
-                           :client     (tst/atom-client state)
-                           :generator  (->> gen/cas
-                                            (gen/limit n)
-                                            (gen/nemesis gen/void))
-                           :model      (model/->CASRegister 0)))]
-    (is (:valid? (:results test)))))
+        n     1000
+        nemesis (nemesis-test/test-nem :nem #{:fault})
+        test (assoc tst/noop-test
+                       :name      "basic cas pure-gen"
+                       :db        db
+                       :client    (tst/atom-client state meta-log)
+                       :nemesis   nemesis
+                       :concurrency (* 2 (count (:nodes tst/noop-test)))
+                       :pure-generators true
+                       :generator
+                       (->> (gen/phases
+                              {:f :read}
+                              (->> (gen/reserve
+                                     5 (repeat {:f :read})
+                                     (gen/mix
+                                       [(fn [] {:f :write
+                                                :value (rand-int 5)})
+                                        (fn [] {:f :cas
+                                                :value [(rand-int 5)
+                                                        (rand-int 5)]})]))
+                                   (gen/limit n)))
+                            (gen/nemesis {:type :info, :f :fault})))
+        test     (run! test)
+        h        (:history test)
+        invokes  (partial filter h/invoke?)
+        oks      (partial filter h/ok?)
+        reads    (partial filter (comp #{:read} :f))
+        writes   (partial filter (comp #{:write} :f))
+        cases    (partial filter (comp #{:cas} :f))
+        values   (partial map :value)
+        smol?    #(<= 0 % 4)
+        smol-vec? #(and (vector? %)
+                        (= 2 (count %))
+                        (every? smol? %))]
+    (testing "db teardown"
+      (is (= :done @state)))
+
+    (testing "client setup/teardown"
+      (let [n         (count (:nodes test))
+            n2        (* 2 n) ; 2 clients per node, each opened and closing
+            n4        (* 4 n) ; During setup each node goes through open, teardown, setup, close
+            n3        (* 3 n) ; On teardown each client goes through open, teardown, close
+            setup     (take n4 @meta-log)
+            run       (->> @meta-log (drop n4) (drop-last n3))
+            teardown  (take-last n3 @meta-log)]
+        (is (= {:open n,  :teardown n, :setup n, :close n} (frequencies setup)))
+        (is (= {:open n2, :close n2}                       (frequencies run)))
+        (is (= {:open n,  :teardown n, :close n}           (frequencies teardown)))))
+
+    (testing "nemesis setup/teardown"
+      (let [ops (filter (comp #{:nemesis} :process) h)
+            _   (is (= 2 (count ops)))
+            [op op'] ops]
+        ; Generator should have produced a fault
+        (is (= :fault (:f op)))
+        (is (= :fault (:f op')))
+        ; The nemesis should have been set up, but we won't have seen that
+        ; change the original nemesis.
+        (is (false? (:setup? nemesis)))
+        ; But since we write the nemesis to the completion value, THAT should
+        ; have been set up.
+        (let [nemesis' (:value op')]
+          (is (= :nem (:id nemesis')))
+          (is (true? (:setup? nemesis'))))
+        ; Finally, we want to make sure we actually tore down the nemesis. This
+        ; one's stateful, so we read it from the original nemesis.
+        (is (true? @(:teardown? nemesis)))))
+
+    (is (:valid? (:results test)))
+    (testing "first read"
+      (is (= 0 (:value (first (oks (reads h)))))))
+    (testing "history"
+      ; 1 initial read, 1 nemesis fault
+      (is (= (* 2 (+ 2 n)) (count h)))
+      (is (= #{:read :write :cas :fault} (set (map :f h))))
+      (is (every? nil? (values (invokes (reads h)))))
+      (is (every? smol? (values (oks (reads h)))))
+      (is (every? smol? (values (writes h))))
+      (is (every? smol-vec? (values (cases h)))))))
 
 (deftest ^:integration ssh-test
   (let [os-startups  (atom {})
@@ -82,6 +225,7 @@
         nonce-file   "/tmp/jepsen-test"
         test (run! (assoc tst/noop-test
                           :name      "ssh test"
+                          :pure-generators true
                           :os (reify os/OS
                                 (setup! [_ test node]
                                   (swap! os-startups assoc node
@@ -131,22 +275,23 @@
 (deftest ^:integration worker-recovery-test
   ; Workers should only consume n ops even when failing.
   (let [invocations (atom 0)
-        n 12]
-    (run! (assoc tst/noop-test
-                 :name "worker recovery"
-                 :client (reify client/Client
-                           (open!  [c t n] c)
-                           (setup! [c t])
-                           (invoke! [_ _ _]
-                             (swap! invocations inc)
-                             (/ 1 0))
-                           (teardown! [c t])
-                           (close! [c t]))
-                 :checker  (checker/unbridled-optimism)
-                 :generator (->> (gen/queue)
-                                 (gen/limit n)
-                                 (gen/nemesis gen/void))))
-      (is (= n @invocations))))
+        n 12
+        test (run! (assoc tst/noop-test
+                          :name "worker recovery"
+                          :client (reify client/Client
+                                    (open!  [c t n] c)
+                                    (setup! [c t])
+                                    (invoke! [_ _ _]
+                                      (swap! invocations inc)
+                                      (/ 1 0))
+                                    (teardown! [c t])
+                                    (close! [c t]))
+                          :checker  (checker/unbridled-optimism)
+                          :pure-generators true
+                          :generator (->> (repeat {:f :read})
+                                          (gen/limit n)
+                                          (gen/nemesis nil))))]
+    (is (= n @invocations))))
 
 (deftest ^:integration generator-recovery-test
   ; Throwing an exception from a generator shouldn't break the core. We use
@@ -156,19 +301,19 @@
   ; abort cleanly.
   (let [conns (atom #{})]
     (is (thrown-with-msg?
-          ArithmeticException #"Divide by zero"
+          clojure.lang.ExceptionInfo #"Divide by zero"
           (run! (assoc tst/noop-test
                        :name "generator recovery"
                        :client (tracking-client conns)
+                       :pure-generators true
                        :generator (gen/clients
                                     (gen/phases
-                                      (gen/each
+                                      (gen/each-thread
                                         (gen/once
-                                          (reify gen/Generator
-                                            (op [_ test process]
-                                              (if (= process 0)
-                                                (/ 1 0)
-                                                {:type :invoke, :f :meow})))))
+                                          (fn [test ctx]
+                                            (if (= [0] (seq (gen.ctx/free-threads ctx)))
+                                              (/ 1 0)
+                                              {:type :invoke, :f :meow}))))
                                       (gen/once {:type :invoke, :f :done})))))))
     (is (empty? @conns))))
 
@@ -189,6 +334,7 @@
                     (teardown! [n test]     (if (= :teardown t) (assert false)))))
         test (fn [client-type nemesis-type]
                (run! (assoc tst/noop-test
+                            :pure-generators true
                             :client   (client client-type)
                             :nemesis  (nemesis nemesis-type))))]
     (testing "client open"      (is (thrown-with-msg? AssertionError #"false" (test :open  nil))))

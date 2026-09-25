@@ -1,14 +1,18 @@
 (ns jepsen.os.debian
-  "Common tasks for Debian boxes."
-  (:use clojure.tools.logging)
-  (:require [clojure.set :as set]
-            [jepsen.util :refer [meh]]
-            [jepsen.os :as os]
-            [jepsen.control :as c :refer [|]]
+  "Common tasks for Debian Trixie."
+  (:require [clojure [set :as set]
+                     [string :as str]]
+            [clojure.tools.logging :refer [info]]
+            [jepsen [control :as c :refer [|]]
+                    [net :as net]
+                    [os :as os]
+                    [util :as util :refer [meh]]]
             [jepsen.control.util :as cu]
-            [jepsen.net :as net]
-            [clojure.string :as str]
-            [slingshot.slingshot :refer [try+ throw+]]))
+            [clj-commons.slingshot :refer [try+ throw+]]))
+
+(def node-locks
+  "Prevents running apt operations concurrently on the same node."
+  (util/named-locks))
 
 (defn setup-hostfile!
   "Makes sure the hostfile has a loopback entry for the local hostname"
@@ -34,7 +38,8 @@
 (defn update!
   "Apt-get update."
   []
-  (c/su (c/exec :apt-get :update)))
+  (util/with-named-lock node-locks c/*host*
+    (c/su (c/exec :apt-get :--allow-releaseinfo-change :update))))
 
 (defn maybe-update!
   "Apt-get update if we haven't done so recently."
@@ -52,14 +57,16 @@
          (map (fn [line] (str/split line #"\s+")))
          (filter #(= "install" (second %)))
          (map first)
+         (map (fn [p] (str/replace p #":amd64|:i386" {":amd64" "" ":i386" ""})))
          set)))
 
 (defn uninstall!
   "Removes a package or packages."
   [pkg-or-pkgs]
-  (let [pkgs (if (coll? pkg-or-pkgs) pkg-or-pkgs (list pkg-or-pkgs))
-        pkgs (installed pkgs)]
-    (c/su (apply c/exec :apt-get :remove :--purge :-y pkgs))))
+  (util/with-named-lock node-locks c/*host*
+    (let [pkgs (if (coll? pkg-or-pkgs) pkg-or-pkgs (list pkg-or-pkgs))
+          pkgs (installed pkgs)]
+      (c/su (apply c/exec :apt-get :remove :--purge :-y pkgs)))))
 
 (defn installed?
   "Are the given debian packages, or singular package, installed on the current
@@ -79,25 +86,41 @@
 (defn install
   "Ensure the given packages are installed. Can take a flat collection of
   packages, passed as symbols, strings, or keywords, or, alternatively, a map
-  of packages to version strings."
-  [pkgs]
-  (if (map? pkgs)
-    ; Install specific versions
-    (dorun
-      (for [[pkg version] pkgs]
-        (when (not= version (installed-version pkg))
-          (info "Installing" pkg version)
-          (c/exec :env "DEBIAN_FRONTEND=noninteractive" :apt-get :install :-y :--force-yes
-                  (str (name pkg) "=" version)))))
+  of packages to version strings. Can optionally take a collection of
+  additional CLI options to be passed to apt-get."
+  ([pkgs]
+   (install pkgs []))
+  ([pkgs apt-opts]
+   (if (map? pkgs)
+     ; Install specific versions
+     (dorun
+       (for [[pkg version] pkgs]
+         (when (not= version (installed-version pkg))
+           (util/with-named-lock node-locks c/*host*
+             (info "Installing" pkg version)
+             (c/su
+               (c/exec :env "DEBIAN_FRONTEND=noninteractive"
+                       :apt-get :install
+                       :-y
+                       :--allow-downgrades
+                       :--allow-change-held-packages
+                       apt-opts
+                       (str (name pkg) "=" version)))))))
 
-    ; Install any version
-    (let [pkgs    (set (map name pkgs))
-          missing (set/difference pkgs (installed pkgs))]
-      (when-not (empty? missing)
-        (c/su
-          (info "Installing" missing)
-          (apply c/exec :env "DEBIAN_FRONTEND=noninteractive"
-                 :apt-get :install :-y :--force-yes missing))))))
+     ; Install any version
+     (let [pkgs    (set (map name pkgs))
+           missing (set/difference pkgs (installed pkgs))]
+       (when-not (empty? missing)
+         (util/with-named-lock node-locks c/*host*
+           (c/su
+             (info "Installing" missing)
+             (apply c/exec :env "DEBIAN_FRONTEND=noninteractive"
+                    :apt-get :install
+                    :-y
+                    :--allow-downgrades
+                    :--allow-change-held-packages
+                    apt-opts
+                    missing))))))))
 
 (defn add-key!
   "Receives an apt key from the given keyserver."
@@ -120,22 +143,6 @@
        (c/exec :echo apt-line :> list-file)
        (update!)))))
 
-(defn install-jdk8!
-  "Installs an oracle jdk8 via webupd8. Ugh, this is such a PITA."
-  []
-  (c/su
-    (add-repo!
-      "webupd8"
-      "deb http://ppa.launchpad.net/webupd8team/java/ubuntu trusty main"
-      "hkp://keyserver.ubuntu.com:80"
-      "EEA14886")
-    (c/exec :echo "debconf shared/accepted-oracle-license-v1-1 select true" |
-            :debconf-set-selections)
-    (c/exec :echo "debconf shared/accepted-oracle-license-v1-1 seen true" |
-            :debconf-set-selections)
-    (install [:oracle-java8-installer])
-    (install [:oracle-java8-set-default])))
-
 (defn install-jdk11!
   "Installs an openjdk jdk11 via stretch-backports."
   []
@@ -151,32 +158,31 @@
     (info node "setting up debian")
 
     (setup-hostfile!)
-
     (maybe-update!)
 
     (c/su
       ; Packages!
       (install [:apt-transport-https
-                :wget
-                :curl
-                :vim
-                :man-db
-                :faketime
-                :ntpdate
-                :unzip
-                :iptables
-                :psmisc
-                :tar
+                :apt-utils
+                :build-essential
                 :bzip2
+                :curl
+                :dirmngr
+                :faketime
+                :iproute2
+                :iptables
                 :iputils-ping
-                :iproute
-                :rsyslog
                 :logrotate
-                :dirmngr])
-      (try+ (install [:libzip4])
-            (catch [:exit 100] _
-              ; Wrong package name; let's use the old one for jessie
-              (install [:libzip2]))))
+                :man-db
+                :netcat-openbsd
+                :ntpsec-ntpdate
+                :psmisc
+                :rsyslog
+                :tar
+                :tcpdump
+                :unzip
+                :vim
+                :wget]))
 
     (meh (net/heal! (:net test) test)))
 

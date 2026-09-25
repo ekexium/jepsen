@@ -12,16 +12,10 @@ how a system responds to different faults. See
 [jepsen.io](https://jepsen.io/analyses) for examples of the sorts of analyses
 you can carry out with Jepsen.
 
-[![Build Status](https://travis-ci.com/jepsen-io/jepsen.svg?branch=master)](https://travis-ci.com/jepsen-io/jepsen)
+[![Clojars Project](https://img.shields.io/clojars/v/jepsen.svg)](https://clojars.org/jepsen)
+[![cljdoc badge](https://cljdoc.org/badge/jepsen/jepsen)](https://cljdoc.org/d/jepsen/jepsen)
 
-## Documentation
-
-This [tutorial](doc/tutorial/index.md) walks you through writing a Jepsen test
-from scratch.
-
-For reference, see the [API documentation](http://jepsen-io.github.io/jepsen/).
-
-## Design overview
+## Design Overview
 
 A Jepsen test runs as a Clojure program on a *control node*. That program uses
 SSH to log into a bunch of *db nodes*, where it sets up the distributed system
@@ -41,43 +35,137 @@ history, analysis, and any supplementary results are written to the filesystem
 under `store/<test-name>/<date>/` for later review. Symlinks to the latest
 results are maintained at each level for convenience.
 
-## Setting up a Jepsen environment
+## Documentation
 
-Your control node needs a JVM and Leiningen 2 installed. Probably want JNA for
-SSH auth too.
+This [tutorial](doc/tutorial/index.md) walks you through writing a Jepsen test
+from scratch. An independent translation is available in [Chinese](https://jaydenwen123.gitbook.io/zh_jepsen_doc/).
+
+For reference, see the [API documentation](http://jepsen-io.github.io/jepsen/).
+
+[What's Here](doc/whats-here.md) provides an overview of Jepsen's namespaces
+and how they work together.
+
+## Setting up a Jepsen Environment
+
+So, you've got a Jepsen test, and you'd like to run it! Or maybe you'd like to
+start learning how to write tests. You've got several options:
+
+### AWS
+
+One easy way to get a Jepsen cluster is using Jepsen's [AWS Marketplace
+listing](https://aws.amazon.com/marketplace/pp/Jepsen-LLC-Jepsen/B01LZ7Y7U0).
+You can either run a single EC2 VM with serveral DB nodes in containers, or a
+cluster of separate EC2 VMs---this is a little more expensive, but
+significantly faster, and lets you test clock skew. The Marketplace VMs come
+with an hourly fee (generally $1/hour/node), which helps fund Jepsen
+development.
+
+Once you've subscribed to the AWS Marketplace listing, go to your [AWS
+Marketplace Subscriptions
+list](https://us-east-1.console.aws.amazon.com/marketplace/subscriptions/),
+click Jepsen, then "Launch new instance".
+
+**For a real cluster of EC2 VMs**, pick "AWS Cloudformation" and click "Launch
+with Cloudformation". At the "Create Stack" page, click "Next".
+
+On the "Specify Stack Details" page, give the stack a name like `jepsen-test`.
+Pick the SSH key you'd like to use to log in. Enter the CIDR IP range you'd
+like to give access to the control node; you can use your own (public) IP 
+address, or `0.0.0.0/0` if you'd like access from anywhere. Click "Next".
+
+On the "Configure stack options" page, click the checkbox at the bottom to
+acknowledge that the cluster will create some IAM resources (a tiny S3 bucket,
+a few security groups, and the cluster of EC2 VMs, all torn down automatically
+on termination). Click "Next".
+
+On the "Review and create" page, click "Submit".
+
+On the Cloudformation stack page, a timeline will appear as CloudFormation sets
+up the cluster---this will take about four minutes. Click the "Outputs" tab to
+get the control node's public DNS address---something like
+`ec2-12-3-45-67.compute-1.amazonaws.com`.
+
+SSH to the control node using `ssh -i <your-ec2-ssh-key.pem>
+admin@ec2-<whatever>.compute-1.amazonaws.com`. Your DB nodes are named `n1`, `n2`, and you can usually run a test like so:
 
 ```sh
-sudo apt-get install openjdk-8-jre openjdk-8-jre-headless libjna-java
+lein run test --username admin --nodes-file ~/nodes ...
 ```
 
-For your db nodes, you'll need some (I use five) debian boxes. I run debian
-jessie, but some DBs don't need the latest packages so you might get away with
-an older distribution, or possibly ubuntu. Each one should be accessible from
-the control node via SSH. By default they're named n1, n2, n3, n4, and n5, but
-that (along with SSH username, password, identity files, etc) is all definable
-in your test. The account you use on those boxes needs sudo access to set up
-DBs, control firewalls, etc.
+**For a single VM with DB containers**, pick "Amazon EC2", and "Launch from EC2
+Console". Choose version 0.3.11 and click "Launch from EC2".
 
-Be advised that tests may mess with clocks, add apt repos, run killall -9 on
-processes, and generally break things, so you shouldn't, you know, point jepsen
+Pick your favorite instance type (an m8i.xlarge should work fine), set the root
+volume storage to something reasonable--say 32 GB, and click "Launch Instance". Click the instance ID in the green notification that pops up, and copy the
+"Public DNS" address of the instance---something like `ec2-12-3-45-67.compute-1.amazonaws.com`.
+
+SSH to the control node using `ssh -i <your-ec2-ssh-key.pem>
+admin@ec2-<whatever>.compute-1.amazonaws.com`. Launch the DB containers by
+running `jepsen-containers-start`. Your DB nodes are named `c1`, `c2`, ..., and
+are listed in `~/container-nodes`. You can usually run a test like so:
+
+```sh
+lein run test --nodes-file ~/container-nodes ...
+```
+
+### LXC
+
+You can set up your DB nodes as LXC containers, and use your local machine as
+the control node. See the [LXC documentation](doc/lxc.md) for guidelines. This
+might be the easiest setup for hacking on tests: you'll be able to edit source
+code, run profilers, etc on the local node. Containers don't have real clocks,
+so you generally can't use them to test clock skew.
+
+### VMs, Real Hardware, etc.
+
+You should be able to run Jepsen against almost any machines which have:
+
+- A TCP network
+- An SSH server
+- Sudo or root access
+
+Each DB node should be accessible from the control node via SSH: you need to be
+able to run `ssh myuser@some-node`, and get a shell. By default, DB nodes are
+named n1, n2, n3, n4, and n5, but that (along with SSH username, password,
+identity files, etc) is all definable in your test, or at the CLI. The account
+you use on those boxes needs sudo access to set up DBs, control firewalls, etc.
+
+BE ADVISED: tests may mess with clocks, add apt repos, run killall -9 on
+processes, and generally break things, so you shouldn't, you know, point Jepsen
 at your prod machines unless you like to live dangerously, or you wrote the
 test and know exactly what it's doing.
 
-You can run your DB nodes as separate physical machines, VMs, LXC instances, or
-via Docker. Note that containers (LXC and Docker) can't change system clocks,
-so you won't be able to test anything that relies on clock skew.
+NOTE: Most Jepsen tests are written with more specific requirements in
+mind---like running on Debian, using `iptables` for network manipulation, etc.
+See the specific test code for more details.
 
-- You can launch a complete Jepsen cluster from the [AWS
-  Marketplace](https://aws.amazon.com/marketplace/pp/B01LZ7Y7U0?qid=1486758124485&sr=0-1&ref_=srh_res_product_title).
-  Choose "5+1 node cluster" to get an entire cluster as a Cloudformation stack,
-  with SSH keys and firewall rules preconfigured. Choose "Single AMI" if you'd
-  just like a single node.
+### Docker (Unsupported)
 
-- See [lxc.md](doc/lxc.md) for some of my notes on setting up LXC instances.
+Although unsupported by Jepsen, there is a community maintained [Jepsen in Docker, Community Edition](https://github.com/nurturenature/jepsen-docker).
 
-- You can also use [Docker Compose](docker/README.md) for setting up Docker instances.
+### Setting Up Control Nodes
 
-## Running a test
+For AWS, your control node comes preconfigured with all the
+software you'll need to run most Jepsen tests. If you build your own control
+node (or if you're using your local machine as a control node), you'll need a
+few things:
+
+- A [JVM](https://openjdk.java.net/install/)---version 21 or higher.
+- JNA, so the JVM can talk to your SSH.
+- [Leiningen](https://leiningen.org/): a Clojure build tool.
+- [Gnuplot](http://www.gnuplot.info/): how Jepsen renders performance plots.
+- [Graphviz](https://graphviz.org/): how Jepsen renders transactional anomalies.
+
+On Debian, try:
+
+```
+sudo apt install default-jdk libjna-java gnuplot graphviz
+```
+
+... to get the basic requirements in place. Debian's Leiningen packages are
+ancient, so [download lein from the web instead](https://leiningen.org/).
+
+## Running a Test
 
 Once you've got everything set up, you should be able to run `cd aerospike;
 lein test`, and it'll spit out something like
@@ -94,6 +182,105 @@ INFO  jepsen.core - Analysis invalid! (ﾉಥ益ಥ）ﾉ ┻━┻
    [253 255 256]
    ...}}
 ```
+
+## Working With the REPL
+
+Jepsen tests emit `.jepsen` files in the `store/` directory. You can use these
+to investigate a test at the repl. Run `lein repl` in the test directory (which
+should contain `store...`, then load a test using `store/test`:
+
+```clj
+user=> (def t (store/test -1))
+```
+
+-1 is the last test run, -2 is the second-to-last. 0 is the first, 1 is the
+second, and so on. You can also load a by the string directory name. As a handy
+shortcut, clicking on the title of a test in the web interface will copy its
+path to the clipboard.
+
+```clj
+user=> (def t (store/test "/home/aphyr/jepsen.etcd/store/etcd append etcdctl kill/20221003T124714.485-0400"))
+```
+
+These have the same structure as the test maps you're used to working with in
+Jepsen, though without some fields that wouldn't make sense to serialize--no
+`:checker`, `:client`, etc.
+
+```clj
+jepsen.etcd=> (:name t)
+"etcd append etcdctl kill"
+jepsen.etcd=> (:ops-per-key t)
+200
+```
+
+These test maps are also lazy: to speed up working at the REPL, they won't load
+the history or results until you ask for them. Then they're loaded from disk
+and cached.
+
+```clj
+jepsen.etcd=> (count (:history t))
+52634
+```
+
+You can use all the usual Clojure tricks to introspect results and histories.
+Here's an aborted read (G1a) anomaly--we'll pull out the ops which wrote and
+read the aborted read:
+
+```clj
+jepsen.etcd=> (def writer (-> t :results :workload :anomalies :G1a first :writer))
+#'jepsen.etcd/writer
+jepsen.etcd=> (def reader (-> t :results :workload :anomalies :G1a first :op))
+#'jepsen.etcd/reader
+```
+
+The writer appended 11 and 12 to key 559, but failed, returning a duplicate key
+error:
+
+```clj
+jepsen.etcd=> (:value writer)
+[[:r 559 nil] [:r 558 nil] [:append 559 11] [:append 559 12]]
+jepsen.etcd=> (:error writer)
+[:duplicate-key "rpc error: code = InvalidArgument desc = etcdserver: duplicate key given in txn request"]
+```
+
+The reader, however, observed a value for 559 beginning with 12!
+
+```clj
+jepsen.etcd=> (:value reader)
+[[:r 559 [12]] [:r 557 [1]]]
+```
+
+Let's find all successful transactions:
+
+```clj
+jepsen.etcd=> (def txns (->> t :history (filter #(and (= :txn (:f %)) (= :ok (:type %)))) (map :value)))
+#'jepsen.etcd/txns
+```
+
+And restrict those to just operations which affected key 559:
+
+```clj
+jepsen.etcd=> (->> txns (filter (partial some (comp #{559} second))) pprint)
+([[:r 559 [12]] [:r 557 [1]]]
+ [[:r 559 [12]] [:append 559 1] [:r 559 [12 1]]]
+ [[:append 556 32]
+  [:r 556 [1 18 29 32]]
+  [:r 556 [1 18 29 32]]
+  [:r 559 [12 1]]]
+ [[:r 559 [12 1]]]
+ [[:append 559 9] [:r 557 [1 5]] [:r 558 [1]] [:r 558 [1]]]
+ [[:r 559 [12 1 9]] [:r 559 [12 1 9]]]
+ [[:append 559 17]]
+ [[:r 559 [12 1 9 17]] [:append 558 5]]
+ [[:r 559 [12 1 9 17]]
+  [:append 557 22]
+  [:append 559 27]
+  [:r 557 [1 5 12 22]]])
+```
+
+Sure enough, no OK appends of 12 to key 559!
+
+You'll find more functions for slicing-and-dicing tests in `jepsen.store`.
 
 ## FAQ
 
@@ -130,3 +317,28 @@ ssh-keyscan -t rsa n5 >> ~/.ssh/known_hosts
 ```
 
 to add unhashed versions of each node's hostkey to your `~/.ssh/known_hosts`.
+
+### SSHJ auth errors
+
+If you get an exception like `net.schmizz.sshj.transport.TransportException:
+Could not verify 'ssh-ed25519' host key with fingerprint 'bf:4a:...' for 'n1'
+on port 22`, but you're sure you've got the keys in your `~/.ssh/known-hosts`,
+this is because (I think) SSHJ tries to verify only the ed25519 key and
+*ignores* the RSA key. You can add the ed25519 keys explicitly via:
+
+```sh
+ssh-keyscan -t ed25519 n1 >> ~/.ssh/known_hosts
+...
+```
+
+## Other Projects
+
+Additional projects that may be of interest:
+
+- [Jecci](https://github.com/michaelzenz/jecci): A wrapper framework around
+  Jepsen
+- [Porcupine](https://github.com/anishathalye/porcupine): a linearizability
+  checker written in Go.
+- [elle-cli](https://github.com/ligurio/elle-cli): command-line frontend to
+  transactional consistency checkers for black-box databases.
+- [Tickloom](https://github.com/unmeshjoshi/tickloom): A deterministic-simulation framework for building distributed systems, with Jepsen integration for consistency checks.

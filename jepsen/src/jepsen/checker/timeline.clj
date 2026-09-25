@@ -2,12 +2,17 @@
   "Renders an HTML timeline of a history."
   (:require [clojure.core.reducers :as r]
             [clojure.string :as str]
-            [clj-time.coerce :as t-coerce]
-            [hiccup.core :as h]
-            [knossos.history :as history]
-            [jepsen.util :as util :refer [name+ pprint-str]]
-            [jepsen.store :as store]
-            [jepsen.checker :as checker]))
+            [hiccup.core :as hiccup]
+            [java-time.api :as time]
+            [jepsen [checker :as checker]
+                    [history :as h]
+                    [store :as store]
+                    [util :as util :refer [name+ pprint-str]]]
+            [tesser.core :as t]))
+
+(def op-limit
+  "Maximum number of operations to render. Helps make timeline usable on massive histories."
+  10000)
 
 (defn style
   "Generate a CSS style fragment from a map."
@@ -23,7 +28,7 @@
 
 (def stylesheet
   (str ".ops        { position: absolute; }\n"
-       ".op         { position: absolute; padding: 2px; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); transition: all 0.3s cubic-bezier(.25,.8,.25,1); }\n"
+       ".op         { position: absolute; padding: 2px; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); transition: all 0.3s cubic-bezier(.25,.8,.25,1); overflow: hidden; }\n"
        ".op.invoke  { background: #eeeeee; }\n"
        ".op.ok      { background: #6DB6FE; }\n"
        ".op.info    { background: #FFAA26; }\n"
@@ -54,7 +59,24 @@
 
 (defn nemesis? [op] (= :nemesis (:process op)))
 
-(defn render-op    [op] (str "Op:\n" (pprint-str op)))
+(defn render-op-extra-keys
+  "Helper for render-op which renders keys we didn't explicitly print"
+  [op]
+  (->> (dissoc op :process :type :f :index :sub-index :value :time)
+       (map (fn [[k v]]
+              (str "\n " k " " (pr-str v))))
+       (str/join "")))
+
+(defn render-op
+  [op]
+  (str "Op:\n"
+       "{:process " (:process op)
+       "\n :type "  (:type op)
+       "\n :f "     (:f op)
+       "\n :index " (:index op)
+       (render-op-extra-keys op)
+       "\n :value " (:value op) "}"))
+
 (defn render-msg   [op] (str "Msg: " (pr-str (:value op))))
 (defn render-error [op] (str "Err: " (pr-str (:error op))))
 
@@ -68,10 +90,9 @@
     (str "Dur: " dur " ms")))
 
 (defn render-wall-time [test op]
-  (let [start (-> test :start-time t-coerce/to-long)
-        op    (-> op :time util/nanos->ms long)
-        w     (t-coerce/from-long (+ start op))]
-    (str "Wall-clock Time: " w)))
+  (let [w (time/+ (:start-time test)
+                  (time/nanos (:time op)))]
+    (str "Wall-clock Time: " (time/format :iso-offset-time w))))
 
 (defn title [test op start stop]
   (str (when (nemesis? op) (render-msg start))
@@ -142,9 +163,10 @@
 (defn process-index
   "Maps processes to columns"
   [history]
-  (->> history
-       history/processes
-       history/sort-processes
+  (->> (t/map :process)
+       (t/set)
+       (h/tesser history)
+       util/polysort
        (reduce (fn [m p] (assoc m p (count m)))
                {})))
 
@@ -156,24 +178,37 @@
        (mapv (fn [i op] (assoc op :sub-index i)) (range))
        vec))
 
+(defn hiccup
+  "Renders the Hiccup structure for a history."
+  [test history opts]
+  (let [process-index (h/task history build-process-index []
+                              (process-index history))
+        pairs (->> history
+                   sub-index
+                   pairs)
+        pair-count (count pairs)
+        truncated? (< op-limit pair-count)
+        pairs      (take op-limit pairs)]
+    [:html
+     [:head
+      [:style stylesheet]]
+     [:body
+      (breadcrumbs test (:history-key opts))
+      [:h1 (str (:name test) " key " (:history-key opts))]
+      (when truncated?
+        [:div {:class "truncation-warning"}
+         (str "Showing only " op-limit " of " pair-count " operations in this history.")])
+      [:div {:class "ops"}
+       (->> pairs
+            (map (partial pair->div
+                          history
+                          test
+                          @process-index)))]]]))
+
 (defn html
   []
   (reify checker/Checker
     (check [this test history opts]
-      (->> (h/html [:html
-                    [:head
-                     [:style stylesheet]]
-                    [:body
-                     (breadcrumbs test (:history-key opts))
-                     [:h1 (str (:name test) " key " (:history-key opts))]
-                     [:div {:class "ops"}
-                      (->> history
-                           history/complete
-                           sub-index
-                           pairs
-                           (map (partial pair->div
-                                         history
-                                         test
-                                         (process-index history))))]]])
+      (->> (hiccup/html (hiccup test history opts))
            (spit (store/path! test (:subdirectory opts) "timeline.html")))
       {:valid? true})))

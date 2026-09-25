@@ -1,21 +1,44 @@
 (ns jepsen.util
   "Kitchen sink"
-  (:require [clojure.tools.logging :refer [info]]
+  (:refer-clojure :exclude [parse-long]) ; Clojure added this in 1.11.1
+  (:require [clojure [string :as str]
+                     [pprint :as pprint]
+                     [walk :as walk]]
             [clojure.core.reducers :as r]
-            [clojure.string :as str]
-            [clojure.pprint :refer [pprint]]
-            [clojure.walk :as walk]
-            [clojure.java.io :as io]
-            [clj-time.core :as time]
-            [clj-time.local :as time.local]
+            [clojure.data.generators :as dg]
+            [clojure.java [io :as io]
+                          [shell :as shell]]
             [clojure.tools.logging :refer [debug info warn]]
-            [dom-top.core :as dt :refer [bounded-future]]
-            [fipp.edn :as fipp]
-            [knossos.history :as history])
-  (:import (java.util.concurrent.locks LockSupport)
+            [dom-top.core :as dt :refer [loopr bounded-future]]
+            [fipp.ednize]
+            [java-time.api :as time]
+            [jepsen [generator :as gen]
+                    [history :as h]
+                    [print :as print :refer [pprint]]
+                    [random :as rand]]
+            [jepsen.history.fold :refer [loopf]]
+            [potemkin :refer [definterface+ import-vars]]
+            [clj-commons.slingshot :refer [try+ throw+]]
+            [tesser.core :as t])
+  (:import (clojure.lang IDeref)
+           (java.lang Thread
+                      Thread$UncaughtExceptionHandler)
+           (java.lang.reflect Method)
+           (java.util.concurrent.locks LockSupport)
            (java.util.concurrent ExecutionException)
            (java.io File
-                    RandomAccessFile)))
+                    RandomAccessFile)
+           (jepsen.history Op)))
+
+; These are functions that used to live in util, but are now in their own
+; namespaces.
+(import-vars [jepsen.random
+              :refer [zipf exp nonempty-subset nth-empty]
+              :rename {exp              rand-exp
+                       nonempty-subset  random-nonempty-subset
+                       nth              rand-nth
+                       nth-empty        rand-nth-empty}])
+
 
 (defn default
   "Like assoc, but only fills in values which are NOT present in the map."
@@ -37,22 +60,30 @@
     (try (apply f args)
          (catch Exception e e))))
 
-(defn random-nonempty-subset
-  "A randomly selected, randomly ordered, non-empty subset of the given
-  collection."
-  [nodes]
-  (take (inc (rand-int (count nodes))) (shuffle nodes)))
+(defn exception-message
+  "In several places we catch ExceptionInfos, and their string representations
+  usually conceal the important information in their data maps. This function
+  returns a string, suitable for logging, describing an error. It takes a
+  Throwable and any number of args, joined together with spaces. For ex-infos,
+  it follows that with a pretty-printed ex-data map."
+  ([^Throwable t, msg]
+   (if (instance? clojure.lang.ExceptionInfo t)
+     (str msg "\n" (with-out-str (pprint (ex-data t))))
+     msg))
+  ([t msg & more-messages]
+   (exception-message t (str msg " " (str/join " " more-messages)))))
 
 (defn name+
   "Tries name, falls back to pr-str."
   [x]
   (if (instance? clojure.lang.Named x)
-    (name x))
-    (pr-str x))
+    (name x)
+    (pr-str x)))
 
 (def uninteresting-exceptions
   "Exceptions which are less interesting; used by real-pmap and other cases where we want to pick a *meaningful* exception."
   #{java.util.concurrent.BrokenBarrierException
+    java.util.concurrent.TimeoutException
     InterruptedException})
 
 (defn real-pmap
@@ -74,43 +105,150 @@
   []
   (.. Runtime getRuntime availableProcessors))
 
+(defmacro with-shutdown-hook
+  "Takes an expression and a body. Registers the expression as a shutdown hook.
+  Evaluates body, then unregisters the shutdown hook."
+  [hook & body]
+  `(let [^Runnable hook-fn# (bound-fn []
+                              (with-thread-name "Jepsen shutdown hook"
+                                ~hook))
+         ^Thread hook-thread# (Thread. hook-fn#)]
+     (.. (Runtime/getRuntime) (addShutdownHook hook-thread#))
+     (try ~@body
+          (finally
+              (.. (Runtime/getRuntime) (removeShutdownHook hook-thread#))))))
+
 (defn majority
   "Given a number, returns the smallest integer strictly greater than half."
   [n]
-  (inc (int (Math/floor (/ n 2)))))
+  (inc (long (Math/floor (/ n 2)))))
+
+(defn minority
+  "Given a number, returns the largest integer strictly less than half. Minimum
+  0."
+  [n]
+  (max 0 (dec (long (Math/ceil (/ n 2))))))
+
+(defn minority-third
+  "Given a number, returns the largest integer strictly less than 1/3rd.
+  Helpful for testing byzantine fault-tolerant systems."
+  [n]
+  (-> n dec (/ 3) long))
+
+(defn partition-by-vec
+  "A faster version of partition-by which returns a vector of vectors, rather
+  than using lazy seqs. Comes at the cost of eager evaluation."
+  [f xs]
+  (if (seq xs)
+    (loopr [fx     ::init  ; (f x)
+            chunks (transient [])
+            chunk  (transient [])]
+           [x' xs]
+           (let [fx' (f x')]
+             (cond ; Same chunk
+                   (= fx fx')
+                   (recur fx chunks (conj! chunk x'))
+
+                   ; New chunk. First element?
+                   (identical? ::init fx)
+                   (recur fx' chunks (conj! chunk x'))
+
+                   ; New chunk, later element
+                   true
+                   (recur fx'
+                          (conj! chunks (persistent! chunk))
+                          (transient [x']))))
+           ; Done; fold in last chunk
+           (let [chunk (persistent! chunk)]
+             (persistent!
+               (if (= 0 (count chunk))
+                 chunks
+                 (conj! chunks chunk)))))
+    []))
+
+(defn extreme-by*
+  "Helper for min-by and max-by"
+  [f coll retain?]
+  (loopr [x  nil
+          fx ::init]
+         [x' coll]
+         (let [fx' (f x')]
+           (cond ; First round
+                 (identical? fx ::init)
+                 (recur x' fx')
+
+                 ; x' bigger
+                 (retain? (compare fx fx'))
+                 (recur x' fx')
+
+                 ; Keep looking
+                 true
+                 (recur x fx)))
+         x))
 
 (defn min-by
   "Finds the minimum element of a collection based on some (f element), which
   returns Comparables. If `coll` is empty, returns nil."
   [f coll]
-  (when (seq coll)
-    (reduce (fn [m e]
-              (if (pos? (compare (f m) (f e)))
-                e
-                m))
-            coll)))
+  (extreme-by* f coll pos?))
 
 (defn max-by
   "Finds the maximum element of a collection based on some (f element), which
   returns Comparables. If `coll` is empty, returns nil."
   [f coll]
-  (when (seq coll)
-    (reduce (fn [m e]
-              (if (neg? (compare (f m) (f e)))
-                e
-                m))
-            coll)))
+  (extreme-by* f coll neg?))
 
 (defn fast-last
   "Like last, but O(1) on counted collections."
   [coll]
   (nth coll (dec (count coll))))
 
-(defn rand-nth-empty
-  "Like rand-nth, but returns nil if the collection is empty."
-  [coll]
-  (try (rand-nth coll)
-       (catch IndexOutOfBoundsException e nil)))
+(defn rand-distribution
+  "Generates a random value with a distribution (default `:uniform`) of:
+
+  ```clj
+  ; Uniform distribution from min (inclusive, default 0) to max (exclusive,
+  ; default Long/MAX_VALUE).
+  {:distribution :uniform, :min 0, :max 1024}
+
+  ; Geometric distribution with mean 1/p, starting at 0.
+  {:distribution :geometric, :p 1e-3}
+
+  ; Zipfian integer in [0, n) with skew s (default ~1)
+  {:distribution :zipf, :n 10, :skew 1.5}
+
+  ; Select a value from a sequence with equal probability.
+  {:distribution :one-of, :values [-1, 4097, 1e+6]}
+
+  ; Select a value based on weights. :weights are {value weight ...}
+  {:distribution :weighted :weights {1e-3 1 1e-4 3 1e-5 1}}
+  ```"
+  ([] (rand-distribution {}))
+  ([distribution-map]
+   (let [{:keys [distribution min max p n skew values weights]} distribution-map
+         distribution (or distribution :uniform)
+         min (or min 0)
+         max (or max Long/MAX_VALUE)
+         _   (assert (case distribution
+                       :uniform   (< min max)
+                       :geometric (number? p)
+                       :zipf      (and (integer? n)
+                                       (or (nil? skew) (number? skew)))
+                       :one-of    (seq values)
+                       :weighted  (and (map? weights)
+                                       (->> weights
+                                            vals
+                                            (every? number?)))
+                       false)
+                     (str "Invalid distribution-map: " distribution-map))]
+     (case distribution
+       :uniform   (rand/long min max)
+       :geometric (rand/geometric p)
+       :zipf      (if skew
+                    (rand/zipf skew n)
+                    (rand/zipf n))
+       :one-of    (rand/nth values)
+       :weighted  (rand/weighted weights)))))
 
 (defn fraction
   "a/b, but if b is zero, returns unity."
@@ -127,10 +265,9 @@
     (inc x)))
 
 (defn local-time
-  "Drops millisecond resolution"
+  "Local time."
   []
-  (let [t (time.local/local-now)]
-    (time/minus t (time/millis (time/milli t)))))
+  (time/offset-date-time))
 
 (defn chunk-vec
   "Partitions a vector into reducibles of size n (somewhat like partition-all)
@@ -143,144 +280,74 @@
      (->> (range 0 c n)
           (map #(subvec v % (min c (+ % n))))))))
 
-(def buf-size 1048576)
-
 (defn concat-files!
-  "Appends contents of all fs, writing to out. Returns fs."
+  "Moved to jepsen.print/concat-files!"
   [out fs]
-  (with-open [oc (.getChannel (RandomAccessFile. (io/file out) "rw"))]
-    (doseq [f fs]
-      (with-open [fc (.getChannel (RandomAccessFile. (io/file f) "r"))]
-        (let [size (.size fc)]
-          (loop [position 0]
-            (when (< position size)
-              (recur (+ position (.transferTo fc
-                                              position
-                                              (min (- size position)
-                                                   buf-size)
-                                              oc)))))))))
-  fs)
+  (print/concat-files! out fs))
 
 (defn op->str
-  "Format an operation as a string."
+  "Moved to jepsen.print/op->str"
   [op]
-  (str (:process op)         \tab
-       (:type op)            \tab
-       (pr-str (:f op))      \tab
-       (pr-str (:value op))
-       (when-let [txn (:txn-info op)]
-         (str \tab txn))
-       (when-let [err (:error op)]
-         (str \tab err))))
+  (print/op->str op))
 
 (defn prn-op
-  "Prints an operation to the console."
+  "Moved to jepsen.print/prn-op"
   [op]
-  (pr (:process op)) (print \tab)
-  (pr (:type op))    (print \tab)
-  (pr (:f op))       (print \tab)
-  (pr (:value op))
-  (when-let [txn (:txn-info op)]
-    (print \tab) (print txn))
-  (when-let [err (:error op)]
-    (print \tab) (print err))
-  (print \newline))
+  (print/prn-op op))
 
 (defn print-history
-  "Prints a history to the console."
+  "Moved to jepsen.print/print-history"
   ([history]
-    (print-history prn-op history))
+   (print/print-history history))
   ([printer history]
-   (doseq [op history]
-     (printer op))))
+   (print/print-history printer history)))
 
 (defn write-history!
-  "Writes a history to a file."
+  "Moved to jepsen.print/write-history!"
   ([f history]
-   (write-history! f prn-op history))
+   (print/write-history! f history))
   ([f printer history]
-   (with-open [w (io/writer f)]
-     (binding [*out* w]
-       (print-history printer history)))))
+   (print/write-history! f printer history)))
 
 (defn pwrite-history!
-  "Writes history, taking advantage of more cores."
+  "Moved to jepsen.print/pwrite-history!"
   ([f history]
-    (pwrite-history! f prn-op history))
+    (print/pwrite-history! f history))
   ([f printer history]
-   (if (or (< (count history) 16384) (not (vector? history)))
-     ; Plain old write
-     (write-history! f printer history)
-     ; Parallel variant
-     (let [chunks (chunk-vec (Math/ceil (/ (count history) (processors)))
-                             history)
-           files  (repeatedly (count chunks)
-                              #(File/createTempFile "jepsen-history" ".part"))]
-       (try
-         (->> chunks
-              (map (fn [file chunk]
-                     (bounded-future (write-history! file printer chunk) file))
-                   files)
-              doall
-              (map deref)
-              (concat-files! f))
-         (finally
-           (doseq [f files] (.delete ^File f))))))))
+   (print/pwrite-history! f printer history)))
 
 (defn log-op
-  "Logs an operation and returns it."
+  "Moved to jepsen.print/log-op"
   [op]
-  (info (op->str op))
-  op)
+  (print/log-op op))
 
-(def logger (agent nil))
-(defn log-print
-      [_ & things]
-      (apply println things))
-(defn log
-      [& things]
-      (apply send-off logger log-print things))
+(def log-print
+  "Moved to jepsen.print/log-print"
+  print/log-print)
 
-;(defn all-loggers []
-;  (->> (org.apache.log4j.LogManager/getCurrentLoggers)
-;       (java.util.Collections/list)
-;       (cons (org.apache.log4j.LogManager/getRootLogger))))
+(def log
+  "Moved to jepsen.print/log"
+  print/log)
 
-(defn all-jdk-loggers []
-  (let [manager (java.util.logging.LogManager/getLogManager)]
-    (->> manager
-         .getLoggerNames
-         java.util.Collections/list
-         (map #(.getLogger manager %)))))
+(defn test->str
+  "Moved to jepsen.print/test->str"
+  [test]
+  (print/test->str test))
 
-(defmacro mute-jdk [& body]
-  `(let [loggers# (all-jdk-loggers)
-         levels#  (map #(.getLevel %) loggers#)]
-     (try
-       (doseq [l# loggers#]
-         (.setLevel l# java.util.logging.Level/OFF))
-       ~@body
-       (finally
-         (dorun (map (fn [logger# level#] (.setLevel logger# level#))
-                     loggers#
-                     levels#))))))
+(defn all-jdk-loggers
+  "Moved to jepsen.print/all-jdk-loggers"
+  []
+  (print/all-jdk-loggers))
 
-;(defmacro mute-log4j [& body]
-;  `(let [loggers# (all-loggers)
-;         levels#  (map #(.getLevel %) loggers#)]
-;     (try
-;       (doseq [l# loggers#]
-;         (.setLevel l# org.apache.log4j.Level/OFF))
-;       ~@body
-;       (finally
-;         (dorun (map (fn [logger# level#] (.setLevel logger# level#))
-;                     loggers#
-;                     levels#))))))
+(defmacro mute-jdk
+  "Moved to jepsen.print/mute-jdk"
+  [& body]
+  `(print/mute-jdk ~@body))
 
-(defmacro mute [& body]
-  `(mute-jdk
-;     (mute-log4j
-       ~@body));)
+(defmacro mute
+  "Moved to jepsen.print/mute"
+  [& body]
+  `(print/mute ~@body))
 
 (defn ms->nanos [ms] (* ms 1000000))
 
@@ -296,7 +363,8 @@
   (System/nanoTime))
 
 (def ^:dynamic ^Long *relative-time-origin*
-  "A reference point for measuring time in a test run.")
+  "A reference point for measuring time in a test run."
+  nil)
 
 (defmacro with-relative-time
   "Binds *relative-time-origin* at the start of body."
@@ -324,12 +392,15 @@
     ~@body
      (nanos->ms (- (System/nanoTime) t0#))))
 
-(defn pprint-str [x]
-  (with-out-str (fipp/pprint x {:width 78})))
+(defn pprint-str
+  "Moved to print/pprint-str"
+  [x]
+  (print/pprint-str x))
 
-(defn spy [x]
-  (info (pprint-str x))
-  x)
+(defn spy
+  "Moved to print/spy"
+  [x]
+  (print/spy x))
 
 (defmacro timeout
   "Times out body after n millis, returning timeout-val."
@@ -343,6 +414,50 @@
        (do (future-cancel worker#)
            ~timeout-val)
        retval#)))
+
+(defn await-fn
+  "Invokes a function (f) repeatedly. Blocks until (f) returns, rather than
+  throwing. Returns that return value. Catches Exceptions (except for
+  InterruptedException) and retries them automatically. Options:
+
+    :retry-interval   How long between retries, in ms. Default 1s.
+    :log-interval     How long between logging that we're still waiting, in ms.
+                      Default `retry-interval.
+    :log-message      What should we log to the console while waiting?
+    :timeout          How long until giving up and throwing :type :timeout, in
+                      ms. Default 60 seconds."
+  ([f]
+   (await-fn f {}))
+  ([f opts]
+   (let [log-message    (:log-message opts (str "Waiting for " f "..."))
+         retry-interval (long (:retry-interval opts 1000))
+         log-interval   (:log-interval opts retry-interval)
+         timeout        (:timeout opts 60000)
+         t0             (linear-time-nanos)
+         log-deadline   (atom (+ t0 (* 1e6 log-interval)))
+         deadline       (+ t0 (* 1e6 timeout))]
+     (loop []
+       (let [res (try
+                   (f)
+                   (catch InterruptedException e
+                     (throw e))
+                   (catch Exception e
+                     (let [now (linear-time-nanos)]
+                       ; Are we out of time?
+                       (when (<= deadline now)
+                         (throw+ {:type :timeout} e))
+
+                       ; Should we log something?
+                       (when (<= @log-deadline now)
+                         (info log-message)
+                         (swap! log-deadline + (* log-interval 1e6)))
+
+                       ; Right, sleep and retry
+                       (Thread/sleep retry-interval)
+                       ::retry)))]
+         (if (= ::retry res)
+           (recur)
+           res))))))
 
 (defmacro retry
   "Evals body repeatedly until it doesn't throw, sleeping dt seconds."
@@ -602,8 +717,9 @@
                   s))))))
 
 (defn coll
-  "Wraps non-coll things into singleton lists, and leaves colls as themselves.
-  Useful when you can take either a single thing or a sequence of things."
+  "Wraps non-collection things into singleton lists, and leaves colls as
+  themselves. Useful when you can take either a single thing or a sequence of
+  things."
   [thing-or-things]
   (cond (nil? thing-or-things)  nil
         (coll? thing-or-things) thing-or-things
@@ -618,41 +734,32 @@
         (sequential? thing-or-things) thing-or-things
         true                          (list thing-or-things)))
 
+(defn nil-if-empty
+  "Takes a seqable and returns it, or nil if (seq seqable) is nil. Helpful when
+  you want to return a vector if non-empty, or nil otherwise."
+  [seqable]
+  (if (nil? (seq seqable))
+    nil
+    seqable))
+
 (defn history->latencies
-  "Takes a history--a sequence of operations--and emits the same history but
-  with every invocation containing two new keys:
+  "Takes a history--a sequence of operations--and returns a new history where
+  operations have two new keys:
 
-  :latency    the time in nanoseconds it took for the operation to complete.
-  :completion the next event for that process"
+      :latency    the time in nanoseconds it took for the operation to complete
+                  (if a completion exists)
+      :completion the next event for that process"
   [history]
-  (let [idx (->> history
-                 (map-indexed (fn [i op] [op i]))
-                 (into {}))]
-    (->> history
-         (reduce (fn [[history invokes] op]
-                   (if (= :invoke (:type op))
-                     ; New invocation!
-                     [(conj! history op)
-                      (assoc! invokes (:process op)
-                              (dec (count history)))]
-
-                     (if-let [invoke-idx (get invokes (:process op))]
-                       ; We have an invocation for this process
-                       (let [invoke (get history invoke-idx)
-                             ; Compute latency
-                             l    (- (:time op) (:time invoke))
-                             op (assoc op :latency l)]
-                         [(-> history
-                              (assoc! invoke-idx
-                                      (assoc invoke :latency l, :completion op))
-                              (conj! op))
-                          (dissoc! invokes (:process op))])
-
-                       ; We have no invocation for this process
-                       [(conj! history op) invokes])))
-                 [(transient []) (transient {})])
-         first
-         persistent!)))
+  (h/ensure-pair-index history)
+  (h/map (fn add-latency [^Op op]
+           (if (h/invoke? op)
+             (if-let [^Op c (h/completion history op)]
+               (assoc op
+                      :completion c
+                      :latency (- (.time c) (.time op)))
+               op)
+             op))
+         history))
 
 (defn nemesis-intervals
   "Given a history where a nemesis goes through :f :start and :f :stop type
@@ -824,3 +931,150 @@
   present. Ex. (contains-many? {:a 1 :b 2 :c 3} :a :b :c) => true"
   [m & ks]
   (every? #(contains? m %) ks))
+
+(defn parse-long
+  "Parses a string to a Long. Look, we use this a lot, okay?"
+  [s]
+  (Long/parseLong s))
+
+(defn ex-root-cause
+  "Unwraps throwables to return their original cause."
+  [^Throwable t]
+  (if-let [cause (.getCause t)]
+    (recur cause)
+    t))
+
+(defn arities
+  "The arities of a function class."
+  [^Class c]
+  (keep (fn [^Method method]
+          (when (re-find #"invoke" (.getName method))
+            (alength (.getParameterTypes method))))
+        (-> c .getDeclaredMethods)))
+
+(defn fixed-point
+  "Applies f repeatedly to x until it converges."
+  [f x]
+  (let [x' (f x)]
+    (if (= x x')
+      x
+      (recur f x'))))
+
+(defn sh
+  "A wrapper around clojure.java.shell's sh which throws on nonzero exit."
+  [& args]
+  (let [res (apply shell/sh args)]
+    (when-not (zero? (:exit res))
+      (throw+ (assoc res :type ::nonzero-exit)
+              (str "Shell command " (pr-str args)
+                   " returned exit status " (:exit res) "\n"
+                   (:out res) "\n"
+                   (:err res))))
+    res))
+
+(defn deepfind
+  "Finds things that match a predicate in a nested structure. Returns a
+  lazy sequence of matching things, each represented by a vector *path* which
+  denotes how to access that object, ending in the matching thing itself. Path
+  elements are:
+
+    - keys for maps
+    - integers for sequentials
+    - :member for sets
+    - :deref  for deref-ables.
+
+    (deepfind string? [:a {:b \"foo\"} :c])
+    ; => ([1 :b \"foo\"])
+  "
+  ([pred haystack]
+   (deepfind pred [] haystack))
+  ([pred path haystack]
+   (cond ; This is a match; we're done
+         (pred haystack)
+         [(conj path haystack)]
+
+         (map? haystack)
+         (mapcat (fn [[k v]]
+                   (deepfind pred (conj path k) v))
+                 haystack)
+
+         (sequential? haystack)
+         (->> haystack
+              (map-indexed (fn [i x] (deepfind pred (conj path i) x)))
+              (mapcat identity))
+
+         (set? haystack)
+         (mapcat (partial deepfind pred (conj path :member)) haystack)
+
+         (instance? clojure.lang.IDeref haystack)
+         (deepfind pred (conj path :deref) @haystack)
+
+         true
+         nil)))
+
+(definterface+ IForgettable
+  (forget! [this]
+           "Allows this forgettable reference to be reclaimed by the GC at some
+           later time. Future attempts to dereference it may throw. Returns
+           self."))
+
+(deftype Forgettable [^:unsynchronized-mutable x]
+  IForgettable
+  (forget! [this]
+    (set! x ::forgotten)
+    this)
+
+  ; When used as a generator, Forgettables are transparently unwrapped.
+  jepsen.generator.Generator
+  (update [this test ctx event]
+    (gen/update @this test ctx event))
+
+  (op [this test ctx]
+    (gen/op @this test ctx))
+
+  clojure.lang.IDeref
+  (deref [this]
+    (let [x x]
+      (if (identical? x ::forgotten)
+        (throw+ {:type ::forgotten})
+        x)))
+
+  Object
+  (toString [this]
+    (let [x x]
+      (str "#<Forgettable " (if (identical? x ::forgotten)
+                              "?"
+                              x)
+           ">")))
+
+  (equals [this other]
+    (identical? this other)))
+
+(defn forgettable
+  "Constructs a deref-able reference to x which can be explicitly forgotten.
+  Helpful for controlling access to infinite seqs (e.g. the generator) when you
+  don't have firm control over everyone who might see them."
+  [x]
+  (Forgettable. x))
+
+(defmethod pprint/simple-dispatch jepsen.util.Forgettable
+  [^Forgettable f]
+  (let [prefix (format "#<Forgettable ")]
+    (pprint/pprint-logical-block
+      :prefix prefix :suffix ">"
+      (pprint/pprint-indent :block (-> (count prefix) (- 2) -))
+      (pprint/pprint-newline :linear)
+      (pprint/write-out (try+ @f
+                              (catch [:type ::forgotten] e
+                                "?"))))))
+
+(prefer-method pprint/simple-dispatch
+               jepsen.util.Forgettable clojure.lang.IDeref)
+
+(extend-protocol fipp.ednize/IOverride jepsen.util.Forgettable)
+(extend-protocol fipp.ednize/IEdn jepsen.util.Forgettable
+  (-edn [f]
+    (fipp.ednize/tagged-object f
+                               (try+ @f
+                                     (catch [:type ::forgotten] e
+                                       '?)))))

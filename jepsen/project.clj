@@ -1,47 +1,72 @@
-(defproject  org.clojars.pingcap/jepsen "0.1.15-SNAPSHOT"
+(defproject org.clojars.pingcap/jepsen "0.3.14-SNAPSHOT"
   :description "Distributed systems testing framework."
   :url         "https://jepsen.io"
+  :scm     {:name "git"
+            :url "https://github.com/jepsen-io/jepsen/"
+            :dir ".."}
   :license {:name "Eclipse Public License"
             :url  "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[org.clojure/clojure "1.10.0"]
-                 [org.clojure/data.fressian "0.2.1"]
-                 [org.clojure/tools.logging "0.4.1"]
-                 [spootnik/unilog "0.7.13"]
-                 [org.clojure/tools.cli "0.4.1"]
-                 [clj-time "0.11.0"]
-                 [jepsen.txn "0.1.1"]
-                 [knossos "0.3.4" :exclusions [org.slf4j/slf4j-log4j12]]
-                 [tea-time "1.0.1"]
+  :dependencies [[clojure.java-time "1.4.3"]
+                 [org.clj-commons/byte-streams "0.3.4"
+                  :exclusions [org.clj-commons/primitive-math
+                               potemkin
+                               riddley]]
+                 [org.clojure/clojure "1.12.6"]
+                 [org.clojure/data.fressian "1.1.1"]
+                 [org.clojure/data.generators "1.1.1"]
+                 [org.clojure/tools.logging "1.3.1"]
+                 [org.clojure/tools.cli "1.4.256"]
+                 [spootnik/unilog "0.7.32"
+                  :exclusions [org.slf4j/slf4j-api]]
+                 [elle "0.2.7"]
+                 [io.jepsen/generator "0.1.5"]
+                 [jepsen.txn "0.1.3"]
+                 [knossos "0.3.16"]
                  [clj-ssh "0.5.14"]
-                 [gnuplot "0.1.1"]
-                 [http-kit "2.1.18"]
-                 [ring "1.6.0-beta5"]
-                 [hiccup "1.0.5"]
-                 [metametadata/multiset "0.1.1"]
-                 [byte-streams "0.2.2"]
-                 [dom-top "1.0.5"]
-                 [slingshot "0.12.2"]
-                 [org.clojure/data.codec "0.1.1"]
-                 [fipp "0.6.13"]
-                 [io.lacuna/bifurcan "0.1.0"]]
+                 [gnuplot "0.1.3"]
+                 [http-kit "2.8.1"]
+                 [ring "1.15.5"]
+                 [com.hierynomus/sshj "0.41.1"
+                  :exclusions [org.slf4j/slf4j-api
+                               org.bouncycastle/bcutil-jdk18on]]
+                 [com.jcraft/jsch.agentproxy.connector-factory "0.0.9"]
+                 [com.jcraft/jsch.agentproxy.sshj "0.0.9"
+                  :exclusions [net.schmizz/sshj]]
+                 [org.bouncycastle/bcprov-jdk15on "1.70"]
+                 [hiccup "2.0.0"]
+                 [org.clj-commons/slingshot "0.13.0"]
+                 [org.clojure/data.codec "0.2.1"]]
+  :java-source-paths ["src"]
+  :javac-options ["--release" "21"]
   :main jepsen.cli
   :plugins [[lein-localrepo "0.5.4"]
-            [lein-codox "0.10.3"]]
-  :jvm-opts ["-Xmx32g" "-XX:+UseConcMarkSweepGC" "-XX:+UseParNewGC"
-             "-XX:+CMSParallelRemarkEnabled" "-XX:+AggressiveOpts"
-             "-XX:+UseFastAccessorMethods" "-server"]
+            [lein-codox "0.10.8"]
+            [jonase/eastwood "0.3.10"]]
+  :jvm-opts ["-Xmx32g"
+             "-Djava.awt.headless=true"
+             "-server"]
   :test-selectors {:default (fn [m]
-                              (not (or (:integration m)
-                                       (:logging m))))
+                              (not (or (:perf m)
+                                       (:logging m)
+                                       (:slow m))))
+                   :quick (fn [m]
+                            (not (or (:perf m)
+                                     (:integration m)
+                                     (:logging m)
+                                     (:slow m))))
+                   :focus       :focus
+                   :perf        :perf
                    :logging     :logging
                    :integration :integration}
   :codox {:output-path "doc/"
-          :source-uri "https://github.com/jepsen-io/jepsen/blob/{version}/jepsen/{filepath}#L{line}"
+          :source-uri "https://github.com/jepsen-io/jepsen/blob/v{version}/jepsen/{filepath}#L{line}"
           :metadata {:doc/format :markdown}}
   :profiles {:uberjar {:aot :all}
-             :dev {:jvm-opts ["-Xmx32g" "-XX:+UseConcMarkSweepGC"
-                              "-XX:+UseParNewGC"
-                              "-XX:+CMSParallelRemarkEnabled"
-                              "-XX:+AggressiveOpts"
-                              "-XX:+UseFastAccessorMethods" "-server"
+             :dev {; experimenting with faster startup
+                   ;:aot [jepsen.core]
+                   :dependencies [[criterium "0.4.6"]
+                                  [org.clojure/test.check "1.1.3"]
+                                  [com.gfredericks/test.chuck "0.2.15"]]
+                   :jvm-opts ["-Xmx32g"
+                              "-server"
                               "-XX:-OmitStackTraceInFastThrow"]}})

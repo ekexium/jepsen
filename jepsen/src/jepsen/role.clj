@@ -1,0 +1,259 @@
+(ns jepsen.role
+  "Supports tests where each node has a single, distinct role. For instance,
+  one node might run ZooKeeper, and the remaining nodes might run Kafka.
+
+  Using this namespace requires the test to have a :roles map, whose keys are
+  arbitrary roles, and whose corresponding values are vectors of nodes in the
+  test, like so:
+
+     {:mongod [\"n1\" \"n2\"]
+      :mongos [\"n3\"]}"
+  (:require [clojure.tools.logging :refer [info warn]]
+            [dom-top.core :refer [loopr]]
+            [jepsen [client :as client]
+                    [db :as db]
+                    [nemesis :as n]]
+            [jepsen.nemesis.combined :as nc]
+            [clj-commons.slingshot :refer [try+ throw+]])
+  (:import (java.util.concurrent CountDownLatch
+                                 CyclicBarrier)))
+
+(defn role
+  "Takes a test and node. Returns the role for that particular node. Throws if
+  the test does not define a role for that node."
+  [test node]
+  (loopr []
+         [[role nodes] (:roles test)
+          n nodes]
+         (if (= n node)
+           role
+           (recur))
+         (throw+ {:type ::no-role-for-node
+                  :node node
+                  :roles (:roles test)})))
+
+(defn nodes
+  "Returns a vector of nodes associated with a given role, in test order. Right
+  now this returns nil when given a role not in the roles map. I'm not sure if
+  that's more or less useful than throwing. This may change."
+  [test role]
+  (get (:roles test) role))
+
+(defn restrict-test
+  "Takes a barriers atom (a map of node to CyclicBarrier), a test map and a
+  role. Returns a version of the test map where the :nodes are only those for
+  this specific role, and the :barrier is replaced by a fresh CyclicBarrier for
+  the appropriate number of nodes."
+  ([barriers-atom role test]
+   (let [nodes (nodes test role)
+         barrier (get @barriers-atom role)]
+     (when-not (instance? CyclicBarrier barrier)
+       (throw (IllegalStateException.
+                (str "Missing a barrier for role " (pr-str role)
+                     " (barriers are " (pr-str @barriers-atom) ")"))))
+     (assoc test
+            :nodes       nodes
+            :barrier     barrier))))
+
+(defn init-barriers!
+  "Lazily initializes a barriers atom with a test. This atom is a map of roles
+  to CyclicBarriers for that role."
+  [test barriers]
+  (when-not @barriers
+    (->> (:roles test)
+         (map (fn make-barrier [[role nodes]]
+                (let [n (count nodes)]
+                  (when-not (pos? n)
+                    (throw (IllegalArgumentException.
+                             (str "No nodes for role " (pr-str role)
+                                  " (roles are " (pr-str (:roles test)) ")"))))
+                  [role (CyclicBarrier. n)])))
+         (into {})
+         (compare-and-set! barriers nil))))
+
+(defmacro db-helper*
+  "We have to figure out the role, db, and restricted test for every single fn.
+  This anaphoric macro binds these variables to strip out boilerplate. Only for
+  use in DB below, or when writing your own DB and you use *exactly* the form
+  below."
+  [& body]
+  `(let [~'role (role ~'test ~'node)
+         ~'db-map (or (get ~'dbs ~'role)
+                      (throw+ {:type ::no-db-for-role
+                               :role ~'role
+                               :dbs  ~'dbs}))
+         ~'db (:db ~'db-map)
+         ~'test (restrict-test ~'barriers ~'role ~'test)]
+     ~@body))
+
+(defn await-db-setup
+  "Takes a role DB and a role, and blocks until that role has completed all its
+  calls to setup!"
+  [db role]
+  (let [^CountDownLatch latch (get @(:latches db) role)]
+    ; TODO: add parameterizable timeouts; I'm sure we'll get stuck here
+    ; some time.
+    (.await latch)))
+
+(defrecord DB
+  [dbs       ; A map of roles to {:db DB, :deps [...]} maps
+   barriers  ; An atom of roles to CyclicBarriers for each role. This is lazily
+             ; initialized the first time we see the test.
+   latches]  ; An atom of roles to CountDownLatch for each role's setup
+             ; phase. This is lazily initialized the first time we see the
+             ; test.
+
+  db/DB
+  (setup! [this test node]
+    ; Init latches
+    (when-not @latches
+      (->> (:roles test)
+           (map (fn make-latch [[role nodes]]
+                  (let [n (count nodes)]
+                    (assert (pos? n))
+                    [role (CountDownLatch. (count nodes))])))
+           (into {})
+           (compare-and-set! latches nil)))
+    (init-barriers! test barriers)
+    (let [latches @latches]
+      (db-helper*
+        ; Wait for any dependencies
+        (doseq [dep-role (:deps db-map)]
+          (info (pr-str role) "waiting for setup of" (pr-str dep-role))
+          (await-db-setup this dep-role))
+        ; Set up DB
+        (db/setup! db test node)
+        ; And notify our latch
+        (.countDown ^CountDownLatch (get latches role)))))
+
+  (teardown! [_ test node]
+    (init-barriers! test barriers)
+    (db-helper* (db/teardown! db test node)))
+
+  db/Kill
+  (kill! [_ test node] (db-helper* (db/kill! db test node)))
+  (start! [_ test node] (db-helper* (db/start! db test node)))
+
+  db/Pause
+  (pause!  [_ test node] (db-helper* (db/pause! db test node)))
+  (resume! [_ test node] (db-helper* (db/resume! db test node)))
+
+  db/Primary
+  (primaries [db test]
+    ; Call for each role, then combine
+    (->> (:roles test)
+         keys
+         (mapcat (fn [role]
+                   (let [db   (:db (get dbs role))
+                         test (restrict-test barriers role test)]
+                     (when (satisfies? db/Primary db)
+                       (db/primaries db test)))))
+         (into [])))
+
+  ; Setup-primary! always uses the first node; we do that for each role
+  ; independently iff they support Primary.
+  (setup-primary! [db test node]
+    (->> (:roles test)
+         keys
+         (mapv (fn [role]
+                 (let [db   (:db (get dbs role))
+                       test (restrict-test barriers role test)]
+                   (when (satisfies? db/Primary db)
+                     (db/setup-primary! db test (first (:nodes test)))))))))
+
+
+  db/LogFiles
+  (log-files [db test node]
+    (db-helper* (db/log-files db test node))))
+
+(defn db
+  "Takes a map of role -> DB and creates a composite DB which implements the
+  full suite of DB protocols. Setup! on this DB calls the setup! for that
+  particular role's DB for that node, with a restricted test, and so
+  on.
+
+  DBs can also be maps of the following form:
+
+      {:db    A jepsen.db.DB
+       :deps  [:role1, ...], a collection of roles this DB depends on.}
+
+  `setup!` proceeds concurrently on as many nodes as possible, but only when
+  every dependency's setup! has completed on every node."
+  [dbs]
+  (DB. (->> dbs
+            (map (fn expand-dbs [[role db]]
+                   (cond (satisfies? db/DB db)
+                         [role {:db db}]
+
+                         (and (map? db) (satisfies? db/DB (:db db)))
+                         [role db]
+
+                         true
+                         (throw (IllegalArgumentException.
+                                  (str "Role " (pr-str role) " should have been a DB or a map like {:db (DB.), :deps [:role1 ...]}, but we received " (pr-str db)))))))
+            (into {}))
+       (atom nil)   ; Barriers
+       (atom nil))) ; Setup latches
+
+(defrecord RestrictedClient [role client]
+  client/Client
+  (open! [this test node]
+    (let [node-index  (.indexOf ^java.util.List (:nodes test) node)
+          role-nodes  (nodes test role)
+          _           (assert (pos? (count role-nodes))
+                              (str "No nodes for role " (pr-str role)
+                                   " (roles are " (pr-str (:roles test))))
+          node        (nth role-nodes (mod node-index (count role-nodes)))]
+      (client/open! client test node))))
+
+(defn restrict-client
+  "Your test has nodes with different roles, but only one role is client-facing.
+
+  Wraps a jepsen Client `c` in a new Client specific to the given role. This
+  client responds *only* to (client/open! wrapper test node). Instead of
+  connecting to the given node, calls `(client/open! c test node'), where node'
+  is a node with the given role.
+
+  Note that this wrapper evaporates after open!; the inner client takes over
+  thereafter. Calls to `invoke!` etc go directly to the inner client and will
+  receive the full test map, rather than a restricted one. This may come back
+  to bite us later, in which case we'll change."
+  [role client]
+  (RestrictedClient. role client))
+
+(defrecord RestrictedNemesis [role     ; e.g. :storage
+                              barriers ; Atom of role -> CyclicBarrier
+                              nemesis] ; Inner nemesis
+  n/Reflection
+  (fs [_] (n/fs nemesis))
+
+  n/Nemesis
+  (setup! [this test]
+    (init-barriers! test barriers)
+    (RestrictedNemesis. role barriers
+                        (n/setup! nemesis (restrict-test barriers role test))))
+
+  (invoke! [this test op]
+    (n/invoke! nemesis (restrict-test barriers role test) op))
+
+  (teardown! [this test]
+    (init-barriers! test barriers)
+    (n/teardown! nemesis (restrict-test barriers role test))))
+
+(defn restrict-nemesis
+  "Wraps a Nemesis in a new one restricted to a specific role. Calls to the
+  underlying nemesis receive a restricted test map."
+  [role nemesis]
+  (RestrictedNemesis. role (atom nil) nemesis))
+
+(defn restrict-nemesis-package
+  "Restricts a jepsen.nemesis.combined package to act purely on a single role.
+  Right now we just restrict the nemesis, not the generators; maybe later we'll
+  need to do the generators too. Operations in this package have their
+  operation `:f`s lifted to `:f [role f]`. Also adds a :role key to the
+  package, for your use later."
+  [role package]
+  (-> package
+      (assoc :role    role
+             :nemesis (restrict-nemesis role (:nemesis package)))
+      (->> (nc/f-map (partial vector role)))))

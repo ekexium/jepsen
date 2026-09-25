@@ -1,7 +1,6 @@
 (ns jepsen.perf-test
-    (:use jepsen.core
-                  clojure.test
-                  clojure.pprint)
+  (:refer-clojure :exclude [run!])
+  (:use clojure.test)
   (:require [jepsen.os :as os]
             [jepsen.db :as db]
             [jepsen.client :as client]

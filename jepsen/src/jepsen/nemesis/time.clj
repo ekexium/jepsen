@@ -1,55 +1,25 @@
 (ns jepsen.nemesis.time
   "Functions for messing with time and clocks."
-  (:require [jepsen.os.debian :as debian]
+  (:require [clojure.tools.logging :refer [info warn]]
+            [jepsen.os.debian :as debian]
             [jepsen.os.centos :as centos]
             [jepsen [util :as util]
                     [client :as client]
                     [control :as c]
                     [generator :as gen]
-                    [nemesis :as nemesis]]
+                    [nemesis :as nemesis]
+                    [random :as rand]]
+            [jepsen.control.util :as cu]
             [clojure.string :as str]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [clj-commons.slingshot :refer [try+ throw+]])
   (:import (java.io File)))
-
-(defn compile!
-  "Takes a Reader to C source code and spits out a binary to /opt/jepsen/<bin>."
-  [reader bin]
-  (c/su
-    (let [tmp-file (File/createTempFile "jepsen-upload" ".c")]
-      (try
-        (io/copy reader tmp-file)
-        ; Upload
-        (c/exec :mkdir :-p "/opt/jepsen")
-        (c/exec :chmod "a+rwx" "/opt/jepsen")
-        (c/upload (.getCanonicalPath tmp-file) (str "/opt/jepsen/" bin ".c"))
-        (c/cd "/opt/jepsen"
-              (c/exec :gcc (str bin ".c"))
-              (c/exec :mv "a.out" bin))
-        (finally
-          (.delete tmp-file)))))
-  bin)
-
-(defn compile-resource!
-  "Given a resource name, spits out a binary to /opt/jepsen/<bin>."
-  [resource bin]
-  (with-open [r (io/reader (io/resource resource))]
-    (compile! r bin)))
-
-(defn compile-tools!
-  []
-  (compile-resource! "strobe-time.c" "strobe-time")
-  (compile-resource! "bump-time.c" "bump-time"))
 
 (defn install!
   "Uploads and compiles some C programs for messing with clocks."
   []
-  (c/su
-   (try (compile-tools!)
-     (catch RuntimeException e
-       (try (debian/install [:build-essential])
-         (catch RuntimeException e
-           (centos/install [:gcc])))
-       (compile-tools!)))))
+  (nemesis/compile-c-resource! "strobe-time.c" "strobe-time")
+  (nemesis/compile-c-resource! "bump-time.c" "bump-time"))
 
 (defn parse-time
   "Parses a decimal time in unix seconds since the epoch, provided as a string,
@@ -61,12 +31,37 @@
   "Takes a time in seconds since the epoch, and subtracts the local node time,
   to obtain a relative offset in seconds."
   [remote-time]
-  (- remote-time (/ (System/currentTimeMillis) 1000)))
+  (float (- remote-time (/ (System/currentTimeMillis) 1000.0))))
 
 (defn current-offset
   "Returns the clock offset of this node, in seconds."
   []
   (clock-offset (parse-time (c/exec :date "+%s.%N"))))
+
+(defn maybe-disable-ntp!
+  "Tries to turn off any running NTP service. We let these fail
+  quietly--there are lots of ways to run (or not run) NTP."
+  []
+  (c/su
+    ; Systemd took over timekeeping so now we also have to go ask systemd
+    ; to turn that off. Hilariously, the program to control that does an
+    ; RPC call to systemd-timedated, which will then *time out* after 30
+    ; seconds if the service is disabled--which is normal in containers.
+    ;
+    ; root@n1:~# timedatectl status
+    ; Failed to query server: Connection timed out
+    ;
+    ; To work around this, we probe the timedated service first and only
+    ; ask it to disable NTP if it's running. I hate everything about this.
+    (try+ (c/exec :service :timedated :status)
+          ; If this succeeds, we can ask it to stop managing NTP.
+          (c/exec :timedatectl :set-ntp :false)
+          (catch [:type :jepsen.control/nonzero-exit] _
+            ; Service not running
+            ))
+    ; On older Debian platforms, try to stop ntpd service directly
+    (try+ (c/exec :service :ntpd :stop)
+          (catch [:type :jepsen.control/nonzero-exit] _))))
 
 (defn reset-time!
   "Resets the local node's clock to NTP. If a test is given, resets time on all
@@ -87,23 +82,30 @@
   (c/su (c/exec "/opt/jepsen/strobe-time" delta period duration)))
 
 (defn clock-nemesis
-  "Generates a nemesis which manipulates clocks. Accepts three types of
+  "Generates a nemesis which manipulates clocks. Accepts four types of
   operations:
 
       {:f :reset, :value [node1 ...]}
 
       {:f :strobe, :value {node1 {:delta ms, :period ms, :duration s} ...}}
 
-      {:f :bump, :value {node1 delta-ms ...}}"
+      {:f :bump, :value {node1 delta-ms ...}}
+
+      {:f :check-offsets}"
   []
   (reify nemesis/Nemesis
     (setup! [nem test]
-      (c/with-test-nodes test (install!))
-      ; Try to stop ntpd service in case it is present and running.
       (c/with-test-nodes test
-        (try (c/su (c/exec :service :ntpd :stop))
-             (catch RuntimeException e)))
-      (reset-time! test)
+        (install!)
+        (maybe-disable-ntp!)
+        (try+ (reset-time!)
+              (catch [:type :jepsen.control/nonzero-exit, :exit 1] _
+                ; Bit awkward: on some platforms, like containers, we *can't*
+                ; step the time, but the way nemesis composition works makes it
+                ; so that we still get glued into the overall test nemesis even
+                ; if we'll never be called. We'll allow this ntpdate to fail
+                ; silently--it's just to help when we *do* mess with times.
+                )))
       nem)
 
     (invoke! [_ test op]
@@ -132,42 +134,72 @@
         (assoc op :clock-offsets res)))
 
     (teardown! [_ test]
-      (reset-time! test))))
+      (c/with-test-nodes test
+        (try+ (reset-time!)
+              (catch [:type :jepsen.control/nonzero-exit, :exit 1] _
+                ; Bit awkward: on some platforms, like containers, we *can't*
+                ; step the time, but the way nemesis composition works makes it
+                ; so that we still get glued into the overall test nemesis even
+                ; if we'll never be called. We'll allow this ntpdate to fail
+                ; silently--it's just to help when we *do* mess with times.
+                ))))))
 
-(defn reset-gen
-  "Randomized reset generator. Performs resets on random subsets of the tests'
+(defn reset-gen-select
+  "A function which returns a generator of reset operations. Takes a function
+  (select test) which returns nodes from the test we'd like to target for that
+  clock reset."
+  [select]
+  (fn [test process]
+    {:type :info, :f :reset, :value (select test)}))
+
+(def reset-gen
+  "Randomized reset generator. Performs resets on random subsets of the test's
   nodes."
-  [test process]
-  {:type :info, :f :reset, :value (util/random-nonempty-subset (:nodes test))})
+  (reset-gen-select (comp rand/nonempty-subset :nodes)))
 
-(defn bump-gen
-  "Randomized clock bump generator. On random subsets of nodes, bumps the clock
-  from -262 to +262 seconds, exponentially distributed."
-  [test process]
-  {:type  :info
-   :f     :bump
-   :value (zipmap (util/random-nonempty-subset (:nodes test))
-                  (repeatedly (fn []
-                                (long (* (rand-nth [-1 1])
-                                         (Math/pow 2 (+ 2 (rand 16))))))))})
+(defn bump-gen-select
+  "A function which returns a clock bump generator that bumps the clock from
+  -288 to +288 seconds, exponentially distributed. (select test) is used to
+  select which subset of the test's nodes to use as targets in the generator."
+  [select]
+  (fn gen [test process]
+    {:type  :info
+     :f     :bump
+     :value (zipmap (select test)
+                    (repeatedly
+                      (fn rand-offset []
+                        (long (* (rand/nth [-1 1])
+                                 (Math/pow 1.5 (+ 6 (rand/double 25))))))))}))
 
-(defn strobe-gen
-  "Randomized clock strobe generator. On random subsets of the test's nodes,
-  introduces clock strobes from 4 ms to 262 seconds, with a period of 1 ms to
-  1 second, for a duration of 0-32 seconds."
-  [test process]
-  {:type  :info
-   :f     :strobe
-   :value (zipmap (util/random-nonempty-subset (:nodes test))
-                  (repeatedly (fn []
-                                {:delta (long (Math/pow 2 (+ 2 (rand 16))))
-                                 :period (long (Math/pow 2 (rand 10)))
-                                 :duration (rand 32)})))})
+(def bump-gen
+  "Randomized clock bump generator targeting a random subsets of nodes."
+  (bump-gen-select (comp rand/nonempty-subset :nodes)))
+
+(defn strobe-gen-select
+  "A function which returns a clock strobe generator that introduces clock
+  strobes from 4 ms to 262 seconds, with a period of 1 ms to 1 second, for a
+  duration of 0-32 seconds. (select test) is used to select which subset of the
+  test's nodes to use as targets in the generator."
+  [select]
+  (fn [test process]
+    {:type  :info
+     :f     :strobe
+     :value (zipmap (select test)
+                    (repeatedly
+                      (fn []
+                        {:delta (long (Math/pow 2 (+ 2 (rand/double 16))))
+                         :period (long (Math/pow 2 (rand/double 10)))
+                         :duration (rand/double 32)})))}))
+
+(def strobe-gen
+  "Randomized clock strobe generator targeting a random subsets of the test's
+  nodes."
+  (strobe-gen-select (comp util/random-nonempty-subset :nodes)))
 
 (defn clock-gen
   "Emits a random schedule of clock skew operations. Always starts by checking
   the clock offsets to establish an initial bound."
   []
   (gen/phases
-    (gen/once {:type :info, :f :check-offsets})
+    {:type :info, :f :check-offsets}
     (gen/mix [reset-gen bump-gen strobe-gen])))

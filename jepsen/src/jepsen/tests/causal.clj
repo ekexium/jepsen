@@ -1,11 +1,9 @@
 (ns jepsen.tests.causal
   (:refer-clojure :exclude [test])
-  (:require [jepsen
-             [checker :as checker]
-             [generator :as gen]
-             [independent :as independent]]
-            [knossos
-             [op :as op]]
+  (:require [jepsen [checker :as checker]
+                    [generator :as gen]
+                    [history :as h]
+                    [independent :as independent]]
             [clojure.tools.logging :refer [info warn]]
             [clojure.pprint :refer [pprint]]))
 
@@ -86,14 +84,15 @@
   (CausalRegister. 0 0 nil))
 
 (defn check
-  "A series of causally consistent (CC) ops are a causal order (CO). We issue a CO
-  of 5 read (r) and write (w) operations (r w r w r) against a register (key).
-  All operations in this CO must appear to execute in the order provided by
-  the issuing site (process). We also look for anomalies, such as unexpected values"
+  "A series of causally consistent (CC) ops are a causal order (CO). We issue a
+  CO of 5 read (r) and write (w) operations (r w r w r) against a register
+  (key). All operations in this CO must appear to execute in the order provided
+  by the issuing site (process). We also look for anomalies, such as unexpected
+  values"
   [model]
   (reify checker/Checker
     (check [this test history opts]
-      (let [completed (filter op/ok? history)]
+      (let [completed (h/oks history)]
         (loop [s model
                history completed]
           (if (empty? history)
@@ -115,16 +114,17 @@
 (defn cw1 [_ _] {:type :invoke, :f :write, :value 1})
 (defn cw2 [_ _] {:type :invoke, :f :write, :value 2})
 
-(defn test [opts]
+(defn test
+  [opts]
   {:checker (independent/checker (check (causal-register)))
    :generator (->> (independent/concurrent-generator
-                    1
-                    (range)
-                    (fn [k] (gen/seq [ri cw1 r cw2 r])))
+                     1
+                     (range)
+                     (fn [k] [ri cw1 r cw2 r]))
                    (gen/stagger 1)
                    (gen/nemesis
-                    (gen/seq (cycle [(gen/sleep 10)
-                                     {:type :info, :f :start}
-                                     (gen/sleep 10)
-                                     {:type :info, :f :stop}])))
+                     (cycle [(gen/sleep 10)
+                             {:type :info, :f :start}
+                             (gen/sleep 10)
+                             {:type :info, :f :stop}]))
                    (gen/time-limit (:time-limit opts)))})

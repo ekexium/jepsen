@@ -2,89 +2,55 @@
   (:require [clojure.test :refer :all]
             [clojure.pprint :refer [pprint]]
             [clojure.set :as set]
+            [java-time.api :as time]
+            [jepsen [common-test :refer [default-start-time quiet-logging]]
+                    [history :as h]]
             [jepsen.independent :refer :all]
             [jepsen.checker :as checker]
             [jepsen.generator :as gen]
-            [jepsen.generator-test :as gen-test :refer [ops]]))
+            [jepsen.generator.test :as gen.test]
+            [jepsen.history.core :as hc :refer [chunked]]))
 
-(deftest sequential-generator-test
-  (testing "empty keys"
-    (is (= []
-           (ops [:a :b] (sequential-generator [] (fn [k] :x))))))
+(use-fixtures :once quiet-logging)
 
-  (testing "one key"
-    (is (= [{:value [:k1 :ashley]}
-            {:value [:k1 :katchadourian]}]
-           (ops [:a] (sequential-generator
-                       [:k1]
-                       (fn [k] (gen/seq [{:value :ashley}
-                                         {:value :katchadourian}])))))))
+; Tests for independent generators are in generator-test; might want to pull
+; them over here later.
 
-  (testing "n keys"
-    (is (= [[1 0]
-            [2 0]
-            [2 1]
-            [3 0]
-            [3 1]
-            [3 2]]
-           (->> (fn [k] (gen/seq (map (partial array-map :value) (range k))))
-                (sequential-generator [1 2 3])
-                (ops [:a])
-                (map :value)))))
-
-  (testing "concurrency"
-    (let [kmax 1000
-          vmax 10]
-      ; Gotta realize the ranges to work around a concurrency bug in LongRange
-      (is (= (set (for [k (range kmax), v (range vmax)] [k v]))
-             (->> (fn [k] (gen/seq (map (partial array-map :value)
-                                        (doall (range vmax)))))
-                  (sequential-generator (doall (range kmax)))
-                  (ops (range 10))
-                  (map :value)
-                  set))))))
-
-(deftest concurrent-generator-test
-  (testing "empty keys"
-    (is (= []
-           (ops (range 10) (concurrent-generator 1 [] identity)))))
-
-  (testing "Too few threads"
-    (is (thrown-with-msg?
-          Exception
-          #"With 10 worker threads, this jepsen\.concurrent/concurrent-generator cannot run a key with 12 threads concurrently\. Consider raising your test's :concurrency to at least 12\."
-          (ops (range 10) (concurrent-generator 12 [] identity)))))
-
-  (testing "Uneven threads"
-    (is (thrown-with-msg?
-          Exception
-          #"This jepsen\.independent/concurrent-generator has 11 threads to work with, but can only use 10 of those threads to run 5 concurrent keys with 2 threads apiece\. Consider raising or lowering the test's :concurrency to a multiple of 2\."
-          (ops (range 11) (concurrent-generator 2 [] identity)))))
-
-  (testing "Fully concurrent"
-    (let [kmax    10
-          vmax    5
-          n       5
-          threads 100]
-      (is (= (set (for [k (range kmax), v (range vmax)] [k v]))
-             (->> (fn [k] (gen/seq (map (partial array-map :value)
-                                        (range vmax))))
-                  (concurrent-generator n (range kmax))
-                  (ops (range threads))
-                  (map :value)
-                  set))))))
-
+(deftest subhistories-test
+  (let [n 12
+        h0 (->> (range n)
+               (mapv (fn [i]
+                       {:type :invoke, :f :foo, :value (tuple (mod i 3) i)})))
+        ; We want to explicitly chunk this history
+        chunk-size 3
+        chunk-count (/ n chunk-size)
+        _ (assert integer? chunk-count)
+        h (h/history
+            (hc/soft-chunked-vector
+              chunk-count
+              ; Starting indices
+              (range 0 n chunk-size)
+              ; Loader
+              (fn load-nth [i]
+                (let [start (* chunk-size i)]
+                  (subvec h0 start (+ start chunk-size))))))
+        shs (subhistories (history-keys h) h)]
+    (is (= {0 [0 3 6 9]
+            1 [1 4 7 10]
+            2 [2 5 8 11]}
+           (update-vals shs (partial map :value))))))
 
 (deftest checker-test
   (let [even-checker (reify checker/Checker
                        (check [this test history opts]
                          {:valid? (even? (count history))}))
         history (->> (fn [k] (->> (range k)
-                                  (map (partial array-map :value))
-                                  gen/seq))
+                                  (map (partial array-map :value))))
                      (sequential-generator [0 1 2 3])
-                     (ops [:a :b :c])
-                     (concat [{:value :not-sharded}]))]
+                     (gen/nemesis nil)
+                     (gen.test/perfect (gen.test/n+nemesis-context 3))
+                     (concat [{:value :not-sharded}])
+                     (h/history))]
     (is (= {:valid? false
             :results {1 {:valid? true}
                       2 {:valid? false}
@@ -92,6 +58,6 @@
             :failures [2]}
            (checker/check (checker even-checker)
                           {:name "independent-checker-test"
-                           :start-time 0}
+                           :start-time default-start-time}
                           history
                           {})))))

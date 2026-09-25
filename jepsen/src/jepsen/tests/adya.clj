@@ -2,12 +2,11 @@
   "Generators and checkers for tests of Adya's proscribed behaviors for
   weakly-consistent systems. See http://pmg.csail.mit.edu/papers/adya-phd.pdf"
   (:require [jepsen [client :as client]
-             [checker :as checker]
-             [generator :as gen]
-             [independent :as independent]]
+                    [checker :as checker]
+                    [generator :as gen]
+                    [independent :as independent]]
             [clojure.core.reducers :as r]
-            [clojure.set :as set]
-            [knossos.op :as op]))
+            [clojure.set :as set]))
 
 (defn g2-gen
   "With concurrent, unique keys, emits pairs of :insert ops of the form [key
@@ -53,11 +52,10 @@
       2
       (range)
       (fn [k]
-        (gen/seq
-          [(fn [_  _]
-             {:type :invoke :f :insert :value [nil (swap! ids inc)]})
-           (fn [_  _]
-             {:type :invoke :f :insert :value [(swap! ids inc) nil]})])))))
+        [(gen/once (fn [_  _]
+                     {:type :invoke :f :insert :value [nil (swap! ids inc)]}))
+         (gen/once (fn [_  _]
+                     {:type :invoke :f :insert :value [(swap! ids inc) nil]}))]))))
 
 (defn g2-checker
   "Verifies that at most one :insert completes successfully for any given key."

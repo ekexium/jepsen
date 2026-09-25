@@ -11,13 +11,14 @@
   (:require [jepsen [client :as client]
                     [checker :as checker]
                     [independent :as independent]
-                    [generator :as gen]]
+                    [generator :as gen]
+                    [random :as rand]]
             [jepsen.checker.timeline :as timeline]
             [knossos.model :as model]))
 
-(defn w   [_ _] {:type :invoke, :f :write, :value (rand-int 5)})
+(defn w   [_ _] {:type :invoke, :f :write, :value (rand/long 5)})
 (defn r   [_ _] {:type :invoke, :f :read})
-(defn cas [_ _] {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]})
+(defn cas [_ _] {:type :invoke, :f :cas, :value [(rand/long 5) (rand/long 5)]})
 
 (defn test
   "A partial test, including a generator, model, and checker. You'll need to
@@ -42,12 +43,12 @@
                   (range)
                   (fn [k]
                     (cond->> (gen/reserve n r (gen/mix [w cas cas]))
-                         ; We randomize the limit a bit so that over time, keys
-                         ; become misaligned, which prevents us from lining up
-                         ; on Significant Event Boundaries.
-                         (:per-key-limit opts)
-                         (gen/limit (* (+ (rand 0.1) 0.9)
-                                       (:per-key-limit opts )))
+                      ; We randomize the limit a bit so that over time, keys
+                      ; become misaligned, which prevents us from lining up
+                      ; on Significant Event Boundaries.
+                      (:per-key-limit opts)
+                      (gen/limit (* (+ (rand/double 0.1) 0.9)
+                                    (:per-key-limit opts 20)))
 
-                         true
-                         (gen/process-limit (:process-limit opts 20))))))})
+                      true
+                      (gen/process-limit (:process-limit opts 20))))))})

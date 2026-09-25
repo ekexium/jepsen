@@ -11,7 +11,9 @@
             [clojure.java.io :as io]
             [dom-top.core :refer [assert+]]
             [jepsen [core :as jepsen]
+                    [random :as rand]
                     [store :as store]
+                    [util :as util :refer [exception-message map-vals]]
                     [web :as web]]))
 
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
@@ -48,6 +50,60 @@
                     (assoc m k [v])
                     (update m k conj v))))]))
 
+(defn opt-spec-long-name
+  "Takes an option spec like [\"-r\" \"--rate HZ\" ...] and returns \"rate\"."
+  [[_ long-form :as opt-spec]]
+  (if-let [[m name] (re-find #"--([^\s]+)" long-form)]
+    name
+    (throw (IllegalArgumentException.
+             (str "Unexpected long name for option specification "
+                  (pr-str opt-spec))))))
+
+
+(defn merge-opt-specs
+  "Takes two option specifications and merges them together. Where both offer
+  the same option name, prefers the latter."
+  [a b]
+  (->> (merge (group-by opt-spec-long-name a)
+              (group-by opt-spec-long-name b))
+       vals
+       (map first)))
+
+(defn without-default
+  "Removes a :default x from a vector (e.g. a single option specification for
+  tools.cli)."
+  ([opt-spec]
+   (without-default [] opt-spec))
+  ([filtered [x & xs :as opt-spec]]
+   (cond ; All done
+         (empty? opt-spec)
+         filtered
+
+         ; :default pair
+         (= x :default)
+         (recur filtered (next xs))
+
+         ; Other
+         true
+         (recur (conj filtered x) xs))))
+
+(defn without-defaults-for
+  "Takes a collection of option names like [:workload :nemesis] and a CLI
+  option specification--a vector of option vectors. Rewrites that CLI spec to
+  remove the defaults for the given options. Useful for taking a single opt
+  spec and passing it to `test`, which wants default options, and `test-all`,
+  which often wants to treat the absence of an option specially."
+  [opt-names opt-spec]
+  (let [opt-names (mapv name opt-names)]
+    (mapv (fn without [[_ name-str :as option]]
+            (if (some (fn match? [opt-name]
+                        (= opt-name
+                           (nth (re-find #"--(\[no-\])?([^ ]+)" name-str) 2)))
+                      opt-names)
+              (without-default option)
+              option))
+          opt-spec)))
+
 (def help-opt
   ["-h" "--help" "Print out this message and exit"])
 
@@ -69,7 +125,13 @@
    [nil "--password PASS" "Password for sudo access"
     :default "root"]
 
+   [nil "--seed LONG" "Seed to initialize Jepsen's PRNG. This does not guarantee determinism in general, since the test's behavior depends on the timing and responses to each request, but it may allow specific workloads to be more reproducible."
+    :parse-fn parse-long]
+
    [nil "--strict-host-key-checking" "Whether to check host keys"
+    :default false]
+
+   [nil "--no-ssh" "If set, doesn't try to establish SSH connections to any nodes."
     :default false]
 
    [nil "--ssh-private-key FILE" "Path to an SSH identity file"]
@@ -79,16 +141,22 @@
     :validate [(partial re-find #"^\d+n?$")
                "Must be an integer, optionally followed by n."]]
 
+   [nil "--leave-db-running" "Leave the database running at the end of the test., so you can inspect it."
+    :default false]
+
+   [nil "--logging-json" "Use JSON structured output in the Jepsen log."
+    :default false]
+
    [nil "--test-count NUMBER"
     "How many times should we repeat a test?"
     :default  1
-    :parse-fn #(Long/parseLong %)
+    :parse-fn parse-long
     :validate [pos? "Must be positive"]]
 
    [nil "--time-limit SECONDS"
     "Excluding setup and teardown, how long should a test run for, in seconds?"
     :default  60
-    :parse-fn #(Long/parseLong %)
+    :parse-fn parse-long
     :validate [pos? "Must be positive"]]])
 
 (defn package-opt
@@ -113,6 +181,7 @@ Runs a Jepsen test and exits with a status code:
 
   0     All tests passed
   1     Some test failed
+  2     Some test had an :unknown validity
   254   Invalid arguments
   255   Internal Jepsen error
 
@@ -128,21 +197,27 @@ Options:\n")
     (update parsed :errors conj "No tarball URL provided")))
 
 (defn parse-concurrency
-  "Takes a parsed map. Parses :concurrency; if it is a string ending with n,
-  e.g 3n, sets it to 3 * the number of :nodes. Otherwise, parses as a plain
-  integer."
-  [parsed]
-  (let [c (:concurrency (:options parsed))]
-    (let [[match integer unit] (re-find #"(\d+)(n?)" c)]
-      (when-not match
-        (throw (IllegalArgumentException.
-                 (str "--concurrency " c
-                      " should be an integer optionally followed by n"))))
-      (let [unit (if (= "n" unit)
-                   (count (:nodes (:options parsed)))
-                   1)]
-        (assoc-in parsed [:options :concurrency]
-                  (* unit (Long/parseLong integer)))))))
+  "Takes a parsed map. Parses :concurrency; if it is `nil`, leaves it
+  unchanged,  and if it is a string ending with n, e.g 3n, sets it to 3 * the
+  number of :nodes. Otherwise, parses as a plain integer. With an optional
+  keyword k, parses that key in the parsed map--by default, the key is
+  :concurrency."
+  ([parsed]
+   (parse-concurrency parsed :concurrency))
+  ([parsed k]
+   (if-let [c (get (:options parsed) k)]
+     (let [[match integer unit] (re-find #"(\d+)(n?)" c)]
+       (when-not match
+         (throw (IllegalArgumentException.
+                  (str "--concurrency " c
+                       " should be an integer optionally followed by n"))))
+       (let [unit (if (= "n" unit)
+                    (count (:nodes (:options parsed)))
+                    1)]
+         (assoc-in parsed [:options k]
+                   (* unit (parse-long integer)))))
+     ; No :concurrency
+     parsed)))
 
 (defn parse-nodes
   "Takes a parsed map and merges all the various node specifications together.
@@ -200,20 +275,24 @@ Options:\n")
 (defn rename-ssh-options
   "Takes a parsed map and moves SSH options to a map under :ssh."
   [parsed]
-  (let [{:keys [username
+  (let [{:keys [no-ssh
+                username
                 password
                 strict-host-key-checking
                 ssh-private-key]} (:options parsed)]
     (assoc parsed :options
            (-> (:options parsed)
-               (assoc :ssh {:username                  username
+               (assoc :ssh {:dummy?                    (boolean no-ssh)
+                            :username                  username
                             :password                  password
                             :strict-host-key-checking  strict-host-key-checking
                             :private-key-path          ssh-private-key})
-               (dissoc :username
+               (dissoc :no-ssh
+                       :username
                        :password
                        :strict-host-key-checking
                        :private-key-path)))))
+
 
 (defn test-opt-fn
   "An opt fn for running simple tests. Remaps ssh keys, remaps :node to :nodes,
@@ -221,6 +300,8 @@ Options:\n")
   [parsed]
   (-> parsed
       rename-ssh-options
+      (rename-options {:leave-db-running :leave-db-running?})
+      (rename-options {:logging-json :logging-json?})
       parse-nodes
       parse-concurrency))
 
@@ -252,7 +333,7 @@ Options:\n")
   function with parsed options, and exits with status 0.
 
   Catches exceptions, logs them to the console, and exits with status 255."
-  [subcommands [command & arguments]]
+  [subcommands [command & arguments :as argv]]
   (try
     (assert (not (get subcommands "--help")))
     (assert (not (get subcommands "help")))
@@ -281,6 +362,7 @@ Options:\n")
       (let [{:keys [options arguments summary errors] :as parsed-opts}
             (-> arguments
                 (cli/parse-opts opt-spec)
+                (update :options assoc :argv argv)
                 opt-fn)]
 
         ; Subcommand help
@@ -300,7 +382,8 @@ Options:\n")
         (System/exit 0)))
 
     (catch Throwable t
-      (fatal t "Oh jeez, I'm sorry, Jepsen broke. Here's why:")
+      (fatal t (exception-message t
+                 "Oh jeez, I'm sorry, Jepsen broke. Here's why:"))
       (System/exit 255))))
 
 (defn serve-cmd
@@ -311,22 +394,25 @@ Options:\n")
                         :default "0.0.0.0"]
                        ["-p" "--port NUMBER" "Port number to bind to"
                         :default 8080
-                        :parse-fn #(Long/parseLong %)
+                        :parse-fn parse-long
                         :validate [pos? "Must be positive"]]]
             :opt-fn #(update % :options rename-keys {:host :ip})
             :run (fn [{:keys [options]}]
                    (web/serve! options)
                    (info (str "Listening on http://"
                               (:ip options) ":" (:port options) "/"))
-                   (while true (Thread/sleep 1000)))}})
+                   (loop [] (do
+                              (Thread/sleep 1000)
+                              (recur))))}})
 
 (defn single-test-cmd
   "A command which runs a single test with standard built-ins. Options:
 
-  {:opt-spec A vector of additional options for tools.cli. Appended to
+  {:opt-spec A vector of additional options for tools.cli. Merge into
              `test-opt-spec`. Optional.
    :opt-fn   A function which transforms parsed options. Composed after
              `test-opt-fn`. Optional.
+   :opt-fn*  Replaces test-opt-fn, in case you want to override it altogether.
    :tarball If present, adds a --tarball option to this command, defaulting to
             whatever URL is given here.
    :usage   Defaults to `jc/test-usage`. Optional.
@@ -337,7 +423,7 @@ Options:\n")
   analyzes a history from disk instead.
   "
   [opts]
-  (let [opt-spec (into test-opt-spec (:opt-spec opts))
+  (let [opt-spec (merge-opt-specs test-opt-spec (:opt-spec opts))
         opt-spec (if-let [default-tarball (:tarball opts)]
                    (conj opt-spec
                          [nil "--tarball URL" "URL for the DB tarball to install. May be either HTTP, HTTPS, or a local file on each DB node. For instance, --tarball https://foo.com/bar.tgz, or file:///tmp/bar.tgz"
@@ -351,6 +437,7 @@ Options:\n")
         opt-fn  (if-let [f (:opt-fn opts)]
                   (comp f opt-fn)
                   opt-fn)
+        opt-fn  (or (:opt-fn* opts) opt-fn)
         test-fn (:test-fn opts)]
   {"test" {:opt-spec opt-spec
            :opt-fn   opt-fn
@@ -360,41 +447,144 @@ Options:\n")
                              (with-out-str (pprint options)))
                        (doseq [i (range (:test-count options))]
                          (let [test (jepsen/run! (test-fn options))]
-                           (when-not (:valid? (:results test))
-                             (System/exit 1)))))}
+                           (case (:valid? (:results test))
+                             false    (System/exit 1)
+                             :unknown (System/exit 2)
+                             nil))))}
 
-   "analyze" {:opt-spec opt-spec
-              :opt-fn   opt-fn
-              :usage    (:usage opts test-usage)
-              :run      (fn [{:keys [options]}]
-                          (info "Test options:\n"
-                                (with-out-str (pprint options)))
-                          (let [cli-test    (test-fn options)
-                                stored-test (store/latest)
-                                test (-> stored-test
-                                         (dissoc :results)
-                                         (merge cli-test)
-                                         (assoc :history
-                                                (:history stored-test)))]
+   "analyze"
+   {:opt-spec [["-t" "--test INDEX_OR_PATH" "Index (e.g. -1 for most recent) or path to a Jepsen test file."
+                :default  -1
+                :parse-fn (fn [s]
+                            (if (re-find #"^-?\d+$" s)
+                              (parse-long s)
+                              s))]]
+    :opt-fn   identity
+    :usage    (:usage opts test-usage)
+    :run      (fn [{:keys [options]}]
+                (let [stored-test (store/test (:test options))
+                      _ (info "Analyzing" (.getPath (store/path stored-test)))
+                      argv (:argv stored-test)
+                      _ (info "CLI args were" argv)
+                      _ (assert+ (#{"test" "test-all"} (first argv))
+                                 IllegalArgumentException
+                                 (str "Not sure how to reconstruct test map from CLI args " (str/join " " argv)))
+                      _ (assert+ (map? stored-test)
+                                 IllegalStateException
+                                 "Unable to load test")
+                      ; Reparse original CLI options as if it had been a test
+                      ; cmd
+                      {:keys [options arguments summary errors] :as parsed-opts}
+                      (-> (next argv) (cli/parse-opts opt-spec) opt-fn)
+                      ; And construct a test from those opts
+                      cli-test    (test-fn options)
+                      test (-> cli-test
+                               (merge (dissoc stored-test :results))
+                               (vary-meta merge (meta stored-test)))]
 
-                            (assert+ stored-test IllegalStateException
-                                     "Not sure what the last test was")
-                            (assert+ (= (:name stored-test)
-                                        (:name cli-test))
-                                     IllegalStateException
-                                     (str "Stored test (" (:name stored-test)
-                                          ") and CLI test (" (:name cli-test)
-                                          ") have different names; aborting"))
+                  (binding [*print-length* 32]
+                    (info "Combined test:\n"
+                          (-> test
+                              (update :history (partial take 5))
+                              (update :history vector)
+                              (update :history conj '...)
+                              pprint
+                              with-out-str)))
+                  (store/with-handle [test test]
+                    (jepsen/analyze! test))))}}))
 
-                            (info "Combined test:\n"
-                                  (-> test
-                                      (update :history (partial take 5))
-                                      (update :history vector)
-                                      (update :history conj '...)
-                                      pprint
-                                      with-out-str))
+(defn test-all-run-tests!
+  "Runs a sequence of tests and returns a map of outcomes (e.g. true, :unknown,
+  :crashed, false) to collections of test folders with that outcome. Each test
+  is assigned a new random :seed."
+  [tests]
+  (->> tests
+       (map-indexed
+         (fn [i test]
+           (let [test' (-> test
+                           (assoc :seed (rand/long))
+                           jepsen/prepare-test)]
+             (try
+               (let [test' (jepsen/run! test')]
+                 [(:valid? (:results test'))
+                  (.getPath (store/path test'))])
+               (catch Exception e
+                 (warn e "Test crashed")
+                 [:crashed (.getPath (store/path test'))])))))
+       (group-by first)
+       (map-vals (partial map second))))
 
-                            (jepsen/analyze! test)))}}))
+(defn test-all-print-summary!
+  "Prints a summary of test outcomes. Takes a map of statuses (e.g. :crashed,
+  true, false, :unknown), to test files. Returns results."
+  [results]
+  (println "\n")
+
+  (when (seq (results true))
+    (println "\n# Successful tests\n")
+    (dorun (map println (results true))))
+
+  (when (seq (results :unknown))
+    (println "\n# Indeterminate tests\n")
+    (dorun (map println (results :unknown))))
+
+  (when (seq (results :crashed))
+    (println "\n# Crashed tests\n")
+    (dorun (map println (results :crashed))))
+
+  (when (seq (results false))
+    (println "\n# Failed tests\n")
+    (dorun (map println (results false))))
+
+  (println)
+  (println (count (results true)) "successes")
+  (println (count (results :unknown)) "unknown")
+  (println (count (results :crashed)) "crashed")
+  (println (count (results false)) "failures")
+
+  results)
+
+(defn test-all-exit!
+  "Takes a map of statuses and exits with an appropriate error code: 255 if any
+  crashed, 2 if any were unknown, 1 if any were invalid, 0 if all passed."
+  [results]
+  (System/exit (cond
+                 (:crashed results)   255
+                 (:unknown results)   2
+                 (get results false)  1
+                 true                 0)))
+
+(defn test-all-cmd
+  "A command that runs a whole suite of tests in one go. Options:
+
+    :opt-spec     A vector of additional options for tools.cli. Appended to
+                  test-opt-spec. Optional.
+    :opt-fn       A function which transforms parsed options. Composed after
+                  test-opt-fn. Optional.
+    :opt-fn*      Replaces test-opt-fn, instead of composing with it.
+    :usage        Defaults to `test-usage`. Optional.
+    :tests-fn     A function that receives the transformed option map and
+                  constructs a sequence of tests to run."
+  [opts]
+  (let [opt-spec (merge-opt-specs test-opt-spec (:opt-spec opts))
+        opt-fn  test-opt-fn
+        opt-fn  (if-let [f (:opt-fn opts)]
+                  (comp f opt-fn)
+                  opt-fn)
+        opt-fn  (or (:opt-fn* opts) opt-fn)]
+    {"test-all"
+     {:opt-spec opt-spec
+      :opt-fn   opt-fn
+      :usage    "Runs all tests"
+      :run      (fn run [{:keys [options]}]
+                  (info "CLI options:\n" (with-out-str (pprint options)))
+                  (rand/with-seed (or (:seed options)
+                                      (System/currentTimeMillis))
+                    (->> options
+                         ((:tests-fn opts))
+                         test-all-run-tests!
+                         test-all-print-summary!
+                         test-all-exit!)))}}))
 
 (defn -main
   [& args]

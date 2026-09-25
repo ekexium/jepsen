@@ -1,78 +1,201 @@
 (ns jepsen.checker-test
-  (:refer-clojure :exclude [set])
-  (:use jepsen.checker
-        clojure.test)
-  (:require [knossos [history :as history]
-             [model :as model]
-             [core :refer [ok-op invoke-op fail-op]]
-             [op :as op]]
-            [multiset.core :as multiset]
+  (:refer-clojure :exclude [set flatten])
+  (:use clojure.test)
+  (:require [clojure [datafy :refer [datafy]]
+                     [pprint :refer [pprint]]]
+            [java-time.api :as time]
+            [jepsen [checker :refer :all]
+                    [common-test :refer [default-start-time]]
+                    [db :as db]
+                    [history :as h]
+                    [store :as store]
+                    [tests :as tests]
+                    [util :as util]]
             [jepsen.checker.perf :as cp]
-            [jepsen.util :as util]))
+            [knossos [model :as model]]
+            [multiset.core :as multiset]))
+
+; Helpers for making ops
+(defn invoke-op
+  [process f value]
+  (h/op {:index -1, :type :invoke, :process process, :f f, :value value}))
+
+(defn ok-op
+  [process f value]
+  (h/op {:index -1, :type :ok, :process process, :f f, :value value}))
+
+(defn fail-op
+  [process f value]
+  (h/op {:index -1, :type :fail, :process process, :f f, :value value}))
+
+(defn info-op
+  [process f value]
+  (h/op {:index -1, :type :info, :process process, :f f, :value value}))
+
+(defn history
+  "Takes a sequence of operations and adds times and indexes, returning a
+  History."
+  [h]
+  (->> (condp = (count h)
+         0 h
+         1 [(assoc (first h) :time 0)]
+         (reduce (fn [h op]
+                   (conj h (assoc op :time (+ (:time (peek h)) 1000000))))
+                 [(assoc (first h) :time 0)]
+                 (rest h)))
+       h/strip-indices
+       h/history))
+
+(deftest unhandled-exceptions-test
+  (let [e1 (datafy (IllegalArgumentException. "bad args"))
+        e2 (datafy (IllegalArgumentException. "bad args 2"))
+        e3 (datafy (IllegalStateException. "bad state"))]
+  (is (= {:valid? true
+          :exceptions
+          [{:class 'java.lang.IllegalArgumentException
+            :count 2
+            :example (h/op {:index 1, :process 0, :type :info, :f :foo,
+                            :value 1, :exception e1 :error ["Whoops!"]})}
+           {:class 'java.lang.IllegalStateException
+            :example (h/op {:index 5, :process 0, :type :info, :f :foo, :value
+                            1, :exception e3, :error :oh-no})
+            :count 1}]}
+         (check (unhandled-exceptions) nil
+                (h/history
+                  [{:process 0, :type :invoke, :f :foo, :value 1}
+                   {:process 0, :type :info,   :f :foo, :value 1,
+                    :exception e1, :error ["Whoops!"]}
+                   {:process 0, :type :invoke, :f :foo, :value 1}
+                   {:process 0, :type :info,   :f :foo, :value 1,
+                    :exception e2, :error ["Whoops!" 2]}
+                   {:process 0, :type :invoke, :f :foo, :value 1}
+                   {:process 0, :type :info,   :f :foo, :value 1,
+                    :exception e3, :error :oh-no}])
+                {})))))
+
+(deftest stats-test
+  (is (= {:valid? false
+          :count      5
+          :fail-count 3
+          :info-count 1
+          :ok-count   1
+          :by-f {:foo {:valid?      true
+                       :count       2
+                       :ok-count    1
+                       :fail-count  1
+                       :info-count  0}
+                 :bar {:valid?      false
+                       :count       3
+                       :ok-count    0
+                       :fail-count  2
+                       :info-count  1}}}
+         (check (stats) nil
+                (h/history [{:process 1, :f :foo, :type :ok}
+                            {:process 2, :f :foo, :type :fail}
+                            {:process 3, :f :bar, :type :info}
+                            {:process 4, :f :bar, :type :fail}
+                            {:process 5, :f :bar, :type :fail}])
+                {}))))
 
 (deftest queue-test
   (testing "empty"
-    (is (:valid? (check (queue nil) nil [] {}))))
+    (is (:valid? (check (queue nil) nil (h/history []) {}))))
 
   (testing "Possible enqueue but no dequeue"
     (is (:valid? (check (queue (model/unordered-queue)) nil
-                        [(invoke-op 1 :enqueue 1)] {}))))
+                        (h/history [(invoke-op 1 :enqueue 1)]) {}))))
 
   (testing "Definite enqueue but no dequeue"
     (is (:valid? (check (queue (model/unordered-queue)) nil
-                        [(ok-op 1 :enqueue 1)] {}))))
+                        (h/history [(ok-op 1 :enqueue 1)]) {}))))
 
   (testing "concurrent enqueue/dequeue"
     (is (:valid? (check (queue (model/unordered-queue)) nil
-                        [(invoke-op 2 :dequeue nil)
-                         (invoke-op 1 :enqueue 1)
-                         (ok-op     2 :dequeue 1)] {}))))
+                        (h/history [(invoke-op 2 :dequeue nil)
+                                    (invoke-op 1 :enqueue 1)
+                                    (ok-op     2 :dequeue 1)]) {}))))
 
   (testing "dequeue but no enqueue"
     (is (not (:valid? (check (queue (model/unordered-queue)) nil
-                             [(ok-op 1 :dequeue 1)] {}))))))
+                             (h/history [(ok-op 1 :dequeue 1)]) {}))))))
+
+(deftest set-test-
+  (let [h (h/history
+            [; OK writes
+             {:process 0, :type :invoke, :f :add, :value 0}
+             {:process 0, :type :ok,     :f :add, :value 0}
+             {:process 0, :type :invoke, :f :add, :value 1}
+             {:process 0, :type :ok,     :f :add, :value 1}
+             ; Info writes
+             {:process 1, :type :invoke, :f :add, :value 10}
+             {:process 1, :type :info,   :f :add, :value 10}
+             {:process 1, :type :invoke, :f :add, :value 11}
+             {:process 1, :type :info,   :f :add, :value 11}
+             ; Failed writes
+             {:process 2, :type :invoke, :f :add, :value 20}
+             {:process 2, :type :fail,   :f :add, :value 20}
+             {:process 2, :type :invoke, :f :add, :value 21}
+             {:process 2, :type :fail,   :f :add, :value 21}
+
+             ; Final read
+             {:process 4, :type :invoke, :f :read, :value nil}
+             {:process 4, :type :ok,     :f :read, :value #{0 10 20 30}}])]
+    (is (= {:valid?             false
+            :ok-count           3
+            :ok                 "#{0 10 20}"
+            :lost-count         1
+            :lost               "#{1}"
+            :acknowledged-count 2
+            :recovered-count    2
+            :recovered          "#{10 20}"
+            :attempt-count      6
+            :unexpected-count   1
+            :unexpected         "#{30}"}
+           (check (set) nil h nil)))))
 
 (deftest total-queue-test
   (testing "empty"
-    (is (:valid? (check (total-queue) nil [] {}))))
+    (is (:valid? (check (total-queue) nil (history []) {}))))
 
   (testing "sane"
     (is (= (check (total-queue) nil
-                  [(invoke-op 1 :enqueue 1)
-                   (invoke-op 2 :enqueue 2)
-                   (ok-op     2 :enqueue 2)
-                   (invoke-op 3 :dequeue 1)
-                   (ok-op     3 :dequeue 1)
-                   (invoke-op 3 :dequeue 2)
-                   (ok-op     3 :dequeue 2)]
+                  (history
+                    [(invoke-op 1 :enqueue 1)
+                     (invoke-op 2 :enqueue 2)
+                     (ok-op     2 :enqueue 2)
+                     (invoke-op 3 :dequeue 1)
+                     (ok-op     3 :dequeue 1)
+                     (invoke-op 3 :dequeue 2)
+                     (ok-op     3 :dequeue 2)])
                   {})
-           {:valid?           true
-            :duplicated       (multiset/multiset)
-            :lost             (multiset/multiset)
-            :unexpected       (multiset/multiset)
-            :recovered        (multiset/multiset 1)
-            :attempt-count       2
-            :acknowledged-count  1
-            :ok-count            2
-            :unexpected-count    0
-            :lost-count          0
-            :duplicated-count    0
-            :recovered-count     1})))
+           {:valid?             true
+            :duplicated         (multiset/multiset)
+            :lost               (multiset/multiset)
+            :unexpected         (multiset/multiset)
+            :recovered          (multiset/multiset 1)
+            :attempt-count      2
+            :acknowledged-count 1
+            :ok-count           2
+            :unexpected-count   0
+            :lost-count         0
+            :duplicated-count   0
+            :recovered-count    1})))
 
   (testing "pathological"
     (is (= (check (total-queue) nil
-                  [(invoke-op 1 :enqueue :hung)
-                   (invoke-op 2 :enqueue :enqueued)
-                   (ok-op     2 :enqueue :enqueued)
-                   (invoke-op 3 :enqueue :dup)
-                   (ok-op     3 :enqueue :dup)
-                   (invoke-op 4 :dequeue nil) ; nope
-                   (invoke-op 5 :dequeue nil)
-                   (ok-op     5 :dequeue :wtf)
-                   (invoke-op 6 :dequeue nil)
-                   (ok-op     6 :dequeue :dup)
-                   (invoke-op 7 :dequeue nil)
-                   (ok-op     7 :dequeue :dup)]
+                  (history
+                    [(invoke-op 1 :enqueue :hung)
+                     (invoke-op 2 :enqueue :enqueued)
+                     (ok-op     2 :enqueue :enqueued)
+                     (invoke-op 3 :enqueue :dup)
+                     (ok-op     3 :enqueue :dup)
+                     (invoke-op 4 :dequeue nil) ; nope
+                     (invoke-op 5 :dequeue nil)
+                     (ok-op     5 :dequeue :wtf)
+                     (invoke-op 6 :dequeue nil)
+                     (ok-op     6 :dequeue :dup)
+                     (invoke-op 7 :dequeue nil)
+                     (ok-op     7 :dequeue :dup)])
                   {})
            {:valid?           false
             :lost             (multiset/multiset :enqueued)
@@ -87,9 +210,39 @@
             :duplicated-count 1
             :recovered-count  0}))))
 
+(deftest unique-ids-test
+  (testing "empty"
+    (is (= {:valid?             true
+            :attempted-count    0
+            :acknowledged-count 0
+            :duplicated-count   0
+            :duplicated         {}
+            :range              [nil nil]}
+           (check (unique-ids) nil (history []) nil))))
+
+  (testing "dups"
+    (is (= {:valid?             false
+            :attempted-count    5
+            :acknowledged-count 4
+            :duplicated-count   1
+            :duplicated         {0 3}
+            :range              [0 1]}
+           (check (unique-ids) nil
+                  (history [(invoke-op 0 :generate nil)
+                            (ok-op     0 :generate 0)
+                            (invoke-op 1 :generate nil)
+                            (ok-op     1 :generate 1)
+                            (invoke-op 2 :generate nil)
+                            (ok-op     2 :generate 0)
+                            (invoke-op 3 :generate nil)
+                            (ok-op     3 :generate 0)
+                            (invoke-op 4 :generate nil)
+                            (info-op   4 :generate nil)])
+                  {})))))
+
 (deftest counter-test
   (testing "empty"
-    (is (= (check (counter) nil [] {})
+    (is (= (check (counter) nil (history []) {})
            {:valid? true
             :reads  []
             :errors []})))
@@ -97,28 +250,43 @@
   (testing "initial read"
     (is (= (check (counter)
                   nil
-                  [(invoke-op 0 :read nil)
-                   (ok-op     0 :read 0)]
+                  (history [(invoke-op 0 :read nil)
+                            (ok-op     0 :read 0)])
                   {})
            {:valid? true
             :reads  [[0 0 0]]
             :errors []})))
 
   (testing "ignore failed ops"
-    (is (= (check (counter) nil
-                  [(invoke-op 0 :add 1)
-                   (fail-op   0 :add 1)
-                   (invoke-op 0 :read nil)
-                   (ok-op     0 :read 0)]
-                  {})
-           {:valid? true
+    (is (= {:valid? true
             :reads  [[0 0 0]]
-            :errors []})))
+            :errors []}
+          (check (counter) nil
+                  (history
+                    [(invoke-op 0 :add 1)
+                     (fail-op   0 :add 1)
+                     (invoke-op 0 :read nil)
+                     (ok-op     0 :read 0)])
+                  {}))))
+
+  (testing "incomplete history"
+    (is (= {:valid? true
+            :reads [[0 0 1]
+                   [0 1 1]]
+            :errors []}
+          (check (counter) nil
+                  (history
+                    [(invoke-op 0 :add 1)
+                     (invoke-op 1 :read nil)
+                     (ok-op     1 :read 0)
+                     (invoke-op 1 :read nil)
+                     (ok-op     1 :read 1)])
+                    {}))))
 
   (testing "initial invalid read"
     (is (= (check (counter) nil
-                  [(invoke-op 0 :read nil)
-                   (ok-op     0 :read 1)]
+                  (history [(invoke-op 0 :read nil)
+                            (ok-op     0 :read 1)])
                   {})
            {:valid? false
             :reads  [[0 1 0]]
@@ -126,41 +294,44 @@
 
   (testing "interleaved concurrent reads and writes"
     (is (= (check (counter) nil
-                  [(invoke-op 0 :read nil)
-                   (invoke-op 1 :add 1)
-                   (invoke-op 2 :read nil)
-                   (invoke-op 3 :add 2)
-                   (invoke-op 4 :read nil)
-                   (invoke-op 5 :add 4)
-                   (invoke-op 6 :read nil)
-                   (invoke-op 7 :add 8)
-                   (invoke-op 8 :read nil)
-                   (ok-op     0 :read 6)
-                   (ok-op     1 :add 1)
-                   (ok-op     2 :read 0)
-                   (ok-op     3 :add 2)
-                   (ok-op     4 :read 3)
-                   (ok-op     5 :add 4)
-                   (ok-op     6 :read 100)
-                   (ok-op     7 :add 8)
-                   (ok-op     8 :read 15)]
-                  {})
+                  (history
+                    [(invoke-op 0 :read nil)
+                     (invoke-op 1 :add 1)
+                     (invoke-op 2 :read nil)
+                     (invoke-op 3 :add 2)
+                     (invoke-op 4 :read nil)
+                     (invoke-op 5 :add 4)
+                     (invoke-op 6 :read nil)
+                     (invoke-op 7 :add 8)
+                     (invoke-op 8 :read nil)
+                     (ok-op     0 :read 6)
+                     (ok-op     1 :add 1)
+                     (ok-op     2 :read 0)
+                     (ok-op     3 :add 2)
+                     (ok-op     4 :read 3)
+                     (ok-op     5 :add 4)
+                     (ok-op     6 :read 100)
+                     (ok-op     7 :add 8)
+                     (ok-op     8 :read 15)])
+                    {})
            {:valid? false
             :reads  [[0 6 15] [0 0 15] [0 3 15] [0 100 15] [0 15 15]]
             :errors [[0 100 15]]})))
 
   (testing "rolling reads and writes"
     (is (= (check (counter) nil
-                  [(invoke-op 0 :read nil)
-                   (invoke-op 1 :add  1)
-                   (ok-op     0 :read 0)
-                   (invoke-op 0 :read nil)
-                   (ok-op     1 :add  1)
-                   (invoke-op 1 :add  2)
-                   (ok-op     0 :read 3)
-                   (invoke-op 0 :read nil)
-                   (ok-op     1 :add  2)
-                   (ok-op     0 :read 5)] {})
+                  (history
+                    [(invoke-op 0 :read nil)
+                     (invoke-op 1 :add  1)
+                     (ok-op     0 :read 0)
+                     (invoke-op 0 :read nil)
+                     (ok-op     1 :add  1)
+                     (invoke-op 1 :add  2)
+                     (ok-op     0 :read 3)
+                     (invoke-op 0 :read nil)
+                     (ok-op     1 :add  2)
+                     (ok-op     0 :read 5)])
+                  {})
            {:valid? false
             :reads  [[0 0 1] [0 3 3] [1 5 3]]
             :errors [[1 5 3]]}))))
@@ -171,6 +342,27 @@
          {:a {:valid? true}
           :b {:valid? true}
           :valid? true})))
+
+(deftest flatten-test
+  (testing "flatten all"
+    (is (= (compose {:a 1
+                     :b 2
+                     :c 3
+                     :d 4
+                     :e 5})
+           (flatten (compose {:a 1
+                              :x (compose {:b 2 :c 3})
+                              :y (compose {:d 4 :e 5})})))))
+  (testing "flatten one"
+    (is (= (compose {:a 1
+                     :x (compose {:b 2, :c 3})
+                     :d 4
+                     :e 5})
+           (flatten (compose {:a 1
+                              :x (compose {:b 2 :c 3})
+                              :y (compose {:d 4 :e 5})})
+                    :y)))))
+
 
 (deftest broaden-range-test
   (are [a b, a' b'] (= [a' b'] (cp/broaden-range [a b]))
@@ -229,23 +421,26 @@
   ([latency nemesis?]
    (let [f (rand-nth [:write :read])
          proc (rand-int 100)
-         time (* 1e9 (rand-int 100))
+         time (long (* 1e9 (rand-int 100)))
          type (rand-nth [:ok :ok :ok :ok :ok
                          :fail :info :info])]
-     [{:process proc, :type :invoke, :f f, :time time}
-      {:process proc, :type type,    :f f, :time
-       (+ time latency)}])))
+     [(h/op {:index -1, :process proc, :type :invoke, :f f, :time time})
+      (h/op {:index -1, :process proc, :type type,    :f f,
+             :time (+ time latency)})])))
 
 (deftest perf-test
-  (let [history (->> (repeatedly #(/ 1e9 (inc (rand-int 1000))))
+  (let [history (->> (repeatedly #(long (/ 1e9 (inc (rand-int 1000)))))
                      (mapcat perf-gen)
-                     (take 10000)
-                     vec)]
+                     (take 2000)
+                     h/strip-indices
+                     h/history)]
 
+    ; Go check store/latency graph, store/perf graph, etc to make sure these
+    ; look right
     (testing "can render latency-graph"
       (is (= (check (latency-graph)
                     {:name "latency graph"
-                     :start-time 0}
+                     :start-time default-start-time}
                     history
                     {})
              {:valid? true})))
@@ -253,7 +448,7 @@
     (testing "can render rate-graph"
       (is (= (check (rate-graph)
                     {:name "rate graph"
-                     :start-time 0}
+                     :start-time default-start-time}
                     history
                     {})
              {:valid? true})))
@@ -261,7 +456,7 @@
     (testing "can render combined perf graph"
       (is (= (check (perf)
                     {:name "perf graph"
-                     :start-time 0}
+                     :start-time default-start-time}
                     history
                     {})
              {:latency-graph {:valid? true},
@@ -271,28 +466,30 @@
     (testing "can render a :start :stop nemesis region without opts"
       (let [checker (perf)
             test    {:name "nemesis compatibility perf test"
-                     :start-time 0}
+                     :start-time default-start-time}
             nemesis-ops [{:type :info
                           :process :nemesis
                           :f :start
                           :value nil
-                          :time (* 1e9 5)}
+                          :time (long (* 1e9 5))}
                          {:type :info
                           :process :nemesis
                           :f :start
                           :value [:isolated {"n2" #{"n1" "n4" "n3"}, "n5" #{"n1" "n4" "n3"}, "n1" #{"n2" "n5"}, "n4" #{"n2" "n5"}, "n3" #{"n2" "n5"}}]
-                          :time (* 1e9 20)}
+                          :time (long (* 1e9 20))}
                          {:type :info
                           :process :nemesis
                           :f :stop
                           :value nil
-                          :time (* 1e9 50)}
+                          :time (long (* 1e9 50))}
                          {:type :info
                           :process :nemesis
                           :f :stop
                           :value :network-healed
-                          :time (* 1e9 90)}]
-            history (apply conj history nemesis-ops)]
+                          :time (long (* 1e9 90))}]
+            history (->> (into history nemesis-ops)
+                         h/strip-indices
+                         h/history)]
         (is (= (check checker test history {})
                {:latency-graph {:valid? true},
                 :rate-graph {:valid? true},
@@ -301,18 +498,20 @@
     (testing "can render single nemesis events as bars"
       (let [checker (perf {:nemeses #{{:name "solo nemeses"}}})
             test    {:name "nemeses solo event"
-                     :start-time 0}
+                     :start-time default-start-time}
             nemesis-ops [{:type :info
                           :process :nemesis
                           :f :nemesize
                           :value :spooky!
-                          :time (* 1e9 20)}
+                          :time (long (* 1e9 20))}
                          {:type :info
                           :process :nemesis
                           :f :nemesize
                           :value :woah!
-                          :time (* 1e9 80)}]
-            history (apply conj history nemesis-ops)]
+                          :time (long (* 1e9 80))}]
+            history (->> (into history nemesis-ops)
+                         h/strip-indices
+                         h/history)]
         (is (= (check checker test history {})
                {:latency-graph {:valid? true},
                 :rate-graph {:valid? true},
@@ -321,16 +520,18 @@
     (testing "unfinished starts"
       (let [checker (perf)
             test    {:name "nemeses unfinished start"
-                     :start-time 0}
+                     :start-time default-start-time}
             nemesis-ops [{:type     :info,
                           :process  :nemesis
                           :f        :start
-                          :time     (* 1e9 20)}
+                          :time     (long (* 1e9 20))}
                          {:type     :info
                           :process  :nemesis
                           :f        :start
-                          :time     (* 1e9 25)}]
-            history (apply conj history nemesis-ops)]
+                          :time     (long (* 1e9 25))}]
+            history (->> (into history nemesis-ops)
+                         h/strip-indices
+                         h/history)]
         (is (= (check checker test history {})
                {:latency-graph {:valid? true},
                 :rate-graph {:valid? true},
@@ -343,28 +544,30 @@
                                        :line-color "#6DB6FE"
                                        :line-width 2}}})
             test    {:name "nemeses styling perf test"
-                     :start-time 0}
+                     :start-time default-start-time}
             nemesis-ops [{:type :info
                           :process :nemesis
                           :f :start
                           :value nil
-                          :time (* 1e9 5)}
+                          :time (long (* 1e9 5))}
                          {:type :info
                           :process :nemesis
                           :f :start
                           :value [:isolated {"n2" #{"n1" "n4" "n3"}, "n5" #{"n1" "n4" "n3"}, "n1" #{"n2" "n5"}, "n4" #{"n2" "n5"}, "n3" #{"n2" "n5"}}]
-                          :time (* 1e9 20)}
+                          :time (long (* 1e9 20))}
                          {:type :info
                           :process :nemesis
                           :f :stop
                           :value nil
-                          :time (* 1e9 50)}
+                          :time (long (* 1e9 50))}
                          {:type :info
                           :process :nemesis
                           :f :stop
                           :value :network-healed
-                          :time (* 1e9 90)}]
-            history (apply conj history nemesis-ops)]
+                          :time (long (* 1e9 90))}]
+            history (->> (into history nemesis-ops)
+                         h/strip-indices
+                         h/history)]
         (is (= (check checker test history {})
                {:latency-graph {:valid? true},
                 :rate-graph {:valid? true},
@@ -382,51 +585,53 @@
                                        :fill-color "#87A96B"
                                        :transparency 0.2}}})
             test    {:name "nemeses multiregions perf test"
-                     :start-time 0}
+                     :start-time default-start-time}
 
             ;; Hnnnnnnnnnng we should simplify this... ugly brute force
             nemesis-ops [{:type :info
                           :process :nemesis
                           :f :start1
                           :value nil
-                          :time (* 1e9 5)}
+                          :time (long (* 1e9 5))}
                          {:type :info
                           :process :nemesis
                           :f :start1
                           :value [:isolated {"n2" #{"n1" "n4" "n3"}, "n5" #{"n1" "n4" "n3"}, "n1" #{"n2" "n5"}, "n4" #{"n2" "n5"}, "n3" #{"n2" "n5"}}]
-                          :time (* 1e9 20)}
+                          :time (long (* 1e9 20))}
                          {:type :info
                           :process :nemesis
                           :f :stop1
                           :value nil
-                          :time (* 1e9 40)}
+                          :time (long (* 1e9 40))}
                          {:type :info
                           :process :nemesis
                           :f :stop1
                           :value :network-healed
-                          :time (* 1e9 60)}
+                          :time (long (* 1e9 60))}
 
                          {:type :info
                           :process :nemesis
                           :f :start2.1
                           :value nil
-                          :time (* 1e9 30)}
+                          :time (long (* 1e9 30))}
                          {:type :info
                           :process :nemesis
                           :f :start2.2
                           :value [:isolated {"n2" #{"n1" "n4" "n3"}, "n5" #{"n1" "n4" "n3"}, "n1" #{"n2" "n5"}, "n4" #{"n2" "n5"}, "n3" #{"n2" "n5"}}]
-                          :time (* 1e9 65)}
+                          :time (long (* 1e9 65))}
                          {:type :info
                           :process :nemesis
                           :f :stop2.2
                           :value nil
-                          :time (* 1e9 45)}
+                          :time (long (* 1e9 45))}
                          {:type :info
                           :process :nemesis
                           :f :stop2.1
                           :value :network-healed
-                          :time (* 1e9 95)}]
-            history (apply conj history nemesis-ops)]
+                          :time (long (* 1e9 95))}]
+            history (->> (into history nemesis-ops)
+                         h/strip-indices
+                         h/history)]
         (is (= (check checker test history {})
                {:latency-graph {:valid? true},
                 :rate-graph {:valid? true},
@@ -435,32 +640,36 @@
 (deftest clock-plot-test
   (check (clock-plot)
          {:name       "clock plot test"
-          :start-time 0}
-         [{:process :nemesis, :time 500000000,  :clock-offsets {"n1" 2.1}}
-          {:process :nemesis, :time 1000000000, :clock-offsets {"n1" 0
-                                                                "n2" -3.1}}
-          {:process :nemesis, :time 1500000000, :clock-offsets {"n1" 1
-                                                                "n2" -2}}
-          {:process :nemesis, :time 2000000000, :clock-offsets {"n1" 2
-                                                              "n2" -4.1}}]
+          :start-time default-start-time}
+         (history
+           [{:process :nemesis, :time 500000000,  :clock-offsets {"n1" 2.1}}
+            {:process :nemesis, :time 1000000000, :clock-offsets {"n1" 0
+                                                                  "n2" -3.1}}
+            {:process :nemesis, :time 1500000000, :clock-offsets {"n1" 1
+                                                                  "n2" -2}}
+            {:process :nemesis, :time 2000000000, :clock-offsets {"n1" 2
+                                                                  "n2" -4.1}}])
          {}))
 
-(defn history
-  "Takes a sequence of operations and adds times and indexes."
-  [h]
-  (let [h (history/index h)]
-    (condp = (count h)
-      0 h
-      1 [(assoc (first h) :time 0)]
-      (reduce (fn [h op]
-                (conj h (assoc op :time (+ (:time (peek h))
-                                           1000000))))
-              [(assoc (first h) :time 0)]
-              (rest h)))))
+(deftest op-color-plot-test
+  (check (op-color-plot {})
+         {:name "op color plot test"
+          :start-time default-start-time}
+         (history
+           [{:process 0, :type :invoke}
+            {:process 0, :type :ok}
+            {:process 0, :type :invoke}
+            {:process 0, :type :ok}
+            {:process 0, :type :invoke}
+            {:process 0, :type :fail}
+            {:process 0, :type :invoke}
+            {:process 0, :type :info}])
+         {}))
 
 (deftest set-full-test
   ; Helper fn to check a history
-  (let [c (fn [h] (check (set-full) nil (history h) {}))]
+  (let [c (fn [h]
+            (check (set-full) nil (history h) {}))]
     (testing "never read"
       (is (= {:lost             []
               :attempt-count    1
@@ -624,3 +833,20 @@
                ;
                ; t 0  1   2  3  4    5   6  7  8    9
                (c [a0 a0' a1 r2 r2'1 a1' r2 r3 r3'1 r2'0])))))))
+
+(deftest log-file-pattern-test
+  (let [test (assoc tests/noop-test
+                    :name       "checker-log-file-pattern"
+                    :start-time default-start-time
+                    :nodes      ["n1" "n2" "n3"])]
+    ; Create fake logfiles
+    (spit (store/path! test "n1" "db.log") "foo\nevil1\nevil2 more text\nbar")
+    (spit (store/path! test "n2" "db.log") "foo\nbar\nbaz evil\nfoo\n")
+    ; Check
+    (let [res (check (log-file-pattern "evil\\d+" "db.log")
+                     test nil nil)]
+      (is (= false (:valid? res)))
+      (is (= 2 (:count res)))
+      (is (= [{:node "n1", :line "evil1"}
+              {:node "n1", :line "evil2 more text"}]
+             (:matches res))))))

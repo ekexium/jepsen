@@ -1,7 +1,10 @@
 (ns jepsen.util-test
-  (:use clojure.test
-        clojure.pprint
-        jepsen.util))
+  (:refer-clojure :exclude [parse-long])
+  (:require [clojure [pprint :refer [pprint]]
+                     [test :refer :all]]
+            [fipp.edn :as fipp]
+            [jepsen [history :as h]
+                    [util :refer :all]]))
 
 (deftest majority-test
   (is (= 1 (majority 0)))
@@ -10,6 +13,16 @@
   (is (= 2 (majority 3)))
   (is (= 3 (majority 4)))
   (is (= 3 (majority 5))))
+
+(deftest minority-test
+  (are [expected n] (= expected (minority n))
+       0 0
+       0 1
+       0 2
+       1 3
+       1 4
+       2 5
+       2 6))
 
 (deftest integer-interval-set-str-test
   (is (= (integer-interval-set-str [])
@@ -32,27 +45,28 @@
 
 (deftest history->latencies-test
   (let [history
-        [{:time 11457033239, :process 2, :type :invoke, :f :read}
-         {:time 11457019103, :process 3, :type :invoke, :f :read}
-         {:time 11457111283, :process 4, :type :invoke, :f :cas, :value [0 2]}
-         {:time 11457094604, :process 0, :type :invoke, :f :cas, :value [4 4]}
-         {:time 11457159210, :process 1, :type :invoke, :f :cas, :value [3 1]}
-         {:value nil, :time 11473961208, :process 2, :type :ok, :f :read}
-         {:value nil, :time 11473953899, :process 3, :type :ok, :f :read}
-         {:time 11478831184, :process 4, :type :info, :f :cas, :value [0 2]}
-         {:time 11478852616, :process 1, :type :fail, :f :cas, :value [3 1]}
-         {:time 11478859479, :process 0, :type :fail, :f :cas, :value [4 4]}
-         {:time 12475010505, :process 2, :type :invoke, :f :read}
-         {:time 12475010560, :process :nem :type :info :f :hi}
-         {:time 12475232472, :process 3, :type :invoke, :f :write, :value 0}
-         {:value nil, :time 12477011002, :process 2, :type :ok, :f :read}
-         {:time 12479523408, :process 4, :type :invoke, :f :cas, :value [1 0]}
-         {:time 12479572112, :process 0, :type :invoke, :f :write, :value 1}
-         {:time 12479552107, :process 1, :type :invoke, :f :cas, :value [4 3]}
-         {:time 12480010179, :process 3, :type :ok, :f :write, :value 0}
-         {:time 12481345684, :process 1, :type :fail, :f :cas, :value [4 3]}
-         {:time 12484071466, :process 0, :type :ok, :f :write, :value 1}
-         {:time 12484388730, :process 4, :type :ok, :f :cas, :value [1 0]}]
+        (h/history
+          [{:time 11457033239, :process 2, :type :invoke, :f :read}
+           {:time 11457019103, :process 3, :type :invoke, :f :read}
+           {:time 11457111283, :process 4, :type :invoke, :f :cas, :value [0 2]}
+           {:time 11457094604, :process 0, :type :invoke, :f :cas, :value [4 4]}
+           {:time 11457159210, :process 1, :type :invoke, :f :cas, :value [3 1]}
+           {:value nil, :time 11473961208, :process 2, :type :ok, :f :read}
+           {:value nil, :time 11473953899, :process 3, :type :ok, :f :read}
+           {:time 11478831184, :process 4, :type :info, :f :cas, :value [0 2]}
+           {:time 11478852616, :process 1, :type :fail, :f :cas, :value [3 1]}
+           {:time 11478859479, :process 0, :type :fail, :f :cas, :value [4 4]}
+           {:time 12475010505, :process 2, :type :invoke, :f :read}
+           {:time 12475010560, :process :nem :type :info :f :hi}
+           {:time 12475232472, :process 3, :type :invoke, :f :write, :value 0}
+           {:value nil, :time 12477011002, :process 2, :type :ok, :f :read}
+           {:time 12479523408, :process 4, :type :invoke, :f :cas, :value [1 0]}
+           {:time 12479572112, :process 0, :type :invoke, :f :write, :value 1}
+           {:time 12479552107, :process 1, :type :invoke, :f :cas, :value [4 3]}
+           {:time 12480010179, :process 3, :type :ok, :f :write, :value 0}
+           {:time 12481345684, :process 1, :type :fail, :f :cas, :value [4 3]}
+           {:time 12484071466, :process 0, :type :ok, :f :write, :value 1}
+           {:time 12484388730, :process 4, :type :ok, :f :cas, :value [1 0]}])
         h    (history->latencies history)
         n->m (partial * 1e-6)]
     (->> h
@@ -78,7 +92,7 @@
 
 (deftest letr-test
   (testing "no bindings"
-    (is (= (letr []) nil))
+    (is (= (letr [] nil) nil))
     (is (= (letr [] 1 2) 2)))
 
   (testing "standard bindings"
@@ -112,14 +126,14 @@
 
 (deftest timeout-test
   ; Fast operations pass through the inner result or exception.
-  (is ::success (timeout 1000 ::timed-out
-                         ::success))
+  (is (= ::success (timeout 1000 ::timed-out
+                            ::success)))
   (is (thrown? ArithmeticException
                (timeout 1000 ::timed-out
                         (/ 1 0))))
   ; Slow operations are interrupted and return timeout value.
-  (is ::timed-out (timeout 10 ::timed-out
-                           (Thread/sleep 1000)))
+  (is (= ::timed-out (timeout 10 ::timed-out
+                              (Thread/sleep 1000))))
   ; This is a more complicated version of the previous test that
   ; verifies that the function is interrupted when a timeout occurs.
   (let* [p (promise)
@@ -129,8 +143,8 @@
                         (deliver p ::finished)
                         (catch InterruptedException e
                           (deliver p ::exception))))]
-    (is ::timed-out ret)
-    (is ::exception (deref p 10 ::timed-out))))
+    (is (= ::timed-out ret))
+    (is (= ::exception (deref p 10 ::timed-out)))))
 
 (deftest lazy-atom-test
   (testing "reads"
@@ -161,3 +175,32 @@
         e2 {:process :nemesis, :f :stop, :value 2}]
     (is (= [[s1 e1] [s2 e2] [s3 e1] [s4 e2]]
            (nemesis-intervals [s1 s2 s3 s4 e1 e2])))))
+
+(deftest rand-exp-test
+  (let [n             500
+        target-mean   30
+        samples       (take n (repeatedly (partial rand-exp target-mean)))
+        sum           (reduce + samples)
+        mean          (/ sum n)]
+    ;(prn samples)
+    (is (< (* target-mean 0.7)
+           mean
+           (* target-mean 1.3)))))
+
+(deftest forgettable-test
+  (let [f (forgettable :foo)]
+    (is (= :foo @f))
+    (is (= "#<Forgettable :foo>" (str f)))
+    (is (= "#<Forgettable :foo>\n" (with-out-str (pprint f))))
+    (is (re-find #"^#object\[jepsen.util.Forgettable \"0x\w+\" :foo\]\n$"
+                 (with-out-str (fipp/pprint f))))
+    (forget! f)
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"\{:type :jepsen\.util/forgotten\}"
+                          @f))))
+
+(deftest partition-by-vec-test
+  (is (= [] (partition-by-vec first nil)))
+  (is (= [] (partition-by-vec second [])))
+  (is (= [[1] [2]] (partition-by-vec identity [1 2])))
+  (is (= [[1 2] [-1 -2] [3 3 3]] (partition-by-vec pos? [1 2 -1 -2 3 3 3]))))

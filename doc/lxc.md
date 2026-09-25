@@ -1,209 +1,386 @@
 # How to set up nodes via LXC
-## Debian Testing:
 
-(refer to https://wiki.debian.org/LXC)
+#### [Mint 22.3 Zena](#mint-22.3-zena-1)
+#### [Debian 13/trixie - Incus](#debian-13trixie---incus-1)
 
-```sh
-aptitude install lxc bridge-utils ebtables libvirt-bin debootstrap dnsmasq
-```
+For further information, [LXD - Debian Wiki](https://wiki.debian.org/LXD).
 
-Add this line to /etc/fstab:
+----
 
-```
-cgroup  /sys/fs/cgroup  cgroup  defaults  0   0
-```
+## Mint 22.3 Zena
 
-Mount ze cgroup
-
-```
-mount /sys/fs/cgroup
-```
-
-Apply google and kernel parameters until checkconfig passes:
-
-```
-lxc-checkconfig
-```
-
-Create a VM or five
-
-```
-lxc-create -n n1 -t debian -- --release jessie
-lxc-create -n n2 -t debian -- --release jessie
-lxc-create -n n3 -t debian -- --release jessie
-lxc-create -n n4 -t debian -- --release jessie
-lxc-create -n n5 -t debian -- --release jessie
-```
-
-Note the root passwords.
-
-Edit /var/lib/lxc/n1/config and friends, changing the network hwaddr to something unique. I suggest using sequential mac addresses for n1, n2, n3, ....
-
-```
-# Template used to create this container: /usr/share/lxc/templates/lxc-debian
-# Parameters passed to the template:
-# For additional config options, please look at lxc.conf(5)
-
-lxc.rootfs = /var/lib/lxc/n1/rootfs
-
-# Common configuration
-lxc.include = /usr/share/lxc/config/debian.common.conf
-
-# Container specific configuration
-lxc.mount = /var/lib/lxc/n1/fstab
-lxc.utsname = n1
-lxc.arch = amd64
-
-# Stuff to add:
-lxc.network.type = veth
-lxc.network.flags = up
-lxc.network.link = virbr0
-lxc.network.ipv4 = 0.0.0.0/24
-lxc.network.hwaddr = 00:1E:62:AA:AA:AA
-```
-
-Set up libvirt network, and assign MAC->IP bindings for the LXC node mac addrs
+Install LXC and DNSMasq:
 
 ```sh
-virsh net-edit default
+sudo apt install lxc lxc-templates libvirt-clients dnsmasq
 ```
 
-```xml
-<network>
-  <name>default</name>
-  <uuid>08063db9-38f4-4c9c-8887-08000f13ce80</uuid>
-  <forward mode='nat'/>
-  <bridge name='virbr0' stp='on' delay='0'/>
-  <mac address='52:54:00:8e:29:d2'/>
-  <ip address='192.168.122.1' netmask='255.255.255.0'>
-    <dhcp>
-      <range start='192.168.122.11' end='192.168.122.100'/>
-      <host mac='00:1E:62:AA:AA:AA' name='n1' ip='192.168.122.11'/>
-      <host mac='00:1E:62:AA:AA:AB' name='n2' ip='192.168.122.12'/>
-      <host mac='00:1E:62:AA:AA:AC' name='n3' ip='192.168.122.13'/>
-      <host mac='00:1E:62:AA:AA:AD' name='n4' ip='192.168.122.14'/>
-      <host mac='00:1E:62:AA:AA:AE' name='n5' ip='192.168.122.15'/>
-    </dhcp>
-  </ip>
-</network>
-```
-
-Drop an entry in `/etc/resolv.conf` to read from the libvirt network dns:
-
-```
-nameserver 192.168.122.1  # Local libvirt dnsmasq
-nameserver 192.168.1.1    # Regular network resolver
-```
-
-Kill the system default dnsmasq (if you have one), and start the network (which
-in turn will start a replacement dnsmasq with the LXC config. Then, start up
-all the nodes. I have this in a bash script called `jepsen-start`:
+Update the old GPG keys for debian releases
 
 ```sh
-#!/bin/sh
-sudo service dnsmasq stop
-sudo virsh net-start default
-sudo lxc-start -d -n n1
-sudo lxc-start -d -n n2
-sudo lxc-start -d -n n3
-sudo lxc-start -d -n n4
-sudo lxc-start -d -n n5
+cd /tmp
+wget "https://ftp-master.debian.org/keys/archive-key-13.asc"
+sudo gpg --no-default-keyring --keyring=/etc/apt/trusted.gpg.d/debian-archive-trixie-stable.gpg --import archive-key-13.asc
 ```
 
-Fire up each VM:
+Set up a ZFS filesystem for containers. These are throwaway so I don't bother
+with sync or atime.
 
 ```sh
-jepsen-start
+sudo zfs create -o acltype=posix -o atime=off -o sync=disabled -o mountpoint=/var/lib/lxc rpool/lxc
 ```
 
-Log into the containers, (may have to specify tty 0 to use console correctly) e.g.,:
+If you've got Docker installed, it creates a whole bunch of firewall gunk that
+totally breaks the LXC bridge. Make a script to let LXC talk:
 
 ```sh
-lxc-console --name n1 -t 0
+sudo bash -c "cat >/usr/local/bin/post-docker.sh <<EOF
+#!/usr/bin/env bash
+
+date > /var/log/post-docker-timestamp
+iptables -I DOCKER-USER -i lxcbr0 -j ACCEPT
+iptables -I DOCKER-USER -o lxcbr0 -j ACCEPT
+EOF"
+sudo chmod +x /usr/local/bin/post-docker.sh
 ```
 
-(Optional?) In the containers, update keys used by apt to verify packages:
+And call it after Docker loads:
 
 ```sh
-apt-key update
-apt-get update
+sudo bash -c "cat >/etc/systemd/system/post-docker.service <<EOF
+[Unit]
+Description=Post Docker
+After=docker.service
+BindsTo=docker.service
+ReloadPropagatedFrom=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/post-docker.sh
+ExecReload=/usr/local/bin/post-docker.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+sudo systemctl daemon-reload
+sudo systemctl enable post-docker.service
 ```
 
-And set your root password--I use `root`/`root` by default in Jepsen.
+I think UFW might also interfere? See https://linuxcontainers.org/incus/docs/main/howto/network_bridge_firewalld/#prevent-connectivity-issues-with-incus-and-docker
+
+```
+sudo ufw allow in on lxcbr0
+sudo ufw route allow in on lxcbr0
+sudo ufw route allow out on lxcbr0
+```
+
+Create containers.
 
 ```sh
-passwd
+# To destroy: for i in {1..10}; do sudo lxc-destroy --force -n n$i; done
+for i in {1..10}; do sudo lxc-create -n n$i -t debian -- --release trixie; done
 ```
 
-Copy your SSH key (on host):
+Uncomment this line in `/etc/default/lxc-net` to allow DHCP address reservations:
 
 ```sh
-cat ~/.ssh/id_rsa.pub
+LXC_DHCP_CONFILE=/etc/dnsmasq.conf
 ```
 
-and add it to root's `authorized_keys` (in containers):
+Uncomment `bind-interfaces` in `/etc/dnsmasq.conf`, because otherwise
+systemd-resolved will fight it. Also uncomment `conf-dir`:
+
+```
+bind-interfaces
+conf-dir=/etc/dnsmasq.d
+```
+
+But disable the actual dnsmasq service, because lxc-net will run it.
+
+```
+sudo systemctl stop dnsmasq
+sudo systemctl disable dnsmasq
+```
+
+Disable the systemd-resolved stub listener in `/etc/systemd/resolved.conf`, and
+search the .lxc domain. Ignore resolv.conf, and instead hardcode your preferred
+upstream DNS resolver (mine is 10.0.0.1).
+
+```
+...
+DNSStubListener=no
+DOMAINS=lxc,...
+no-resolv
+server=10.0.0.1
+```
+
+Add DHCP reservations for the nodes. The 10.0.3.xxx here should line up with
+the network address on `lxcbr0`; check `ifconfig lxcbr0`.
+
+```
+for i in {1..10}; do sudo bash -c "echo 'dhcp-host=n$i,10.0.3.1$(printf "%02d" $i)' >> /etc/dnsmasq.d/jepsen.conf"; done
+```
+
+Restart the resolver and LXC networking
+
+```
+sudo systemctl restart systemd-resolved
+sudo systemctl restart lxc-net
+```
+
+Start up a container and confirm that it's assigned the right address:
+
+```
+sudo lxc-start n1
+sudo lxc-ls --fancy
+sudo lxc-stop n1
+```
+
+And add the local dnsmasq to networkmanager
 
 ```sh
-apt-get install -y sudo vim
-mkdir ~/.ssh
-chmod 700 ~/.ssh
-touch ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-vim ~/.ssh/authorized_keys
+sudo bash -c "cat >/etc/NetworkManager/dnsmasq.d/lxc.conf <<EOF
+server=/lxc/10.0.3.1
+EOF"
 ```
 
-Enable password-based login for root (used by jsch):
-```sh
-sed  -i 's,^PermitRootLogin .*,PermitRootLogin yes,g' /etc/ssh/sshd_config
-systemctl restart sshd
-apt install sudo
-```
-
-[Remove systemd](http://without-systemd.org/wiki/index.php/How_to_remove_systemd_from_a_Debian_jessie/sid_installation). After you install sysvinit-core and sysvinit-utils, you may have to restart the container with /lib/sysvinit/init argument to lxc-start before apt will allow you to remove systemd.
-
-Detach from the container with Control+a q, and repeat for the remaining nodes.
-
-On the control node, drop entries in `~/.ssh/config` for nodes:
-
-```
-Host n*
-User root
-```
-
-Store the host keys unencrypted so that jsch can use them. If you already have
-the host keys, they may be unreadable to Jepsen--remove them from .known_hosts
-and rescan.
-
-```
-for n in $(seq 1 5); do ssh-keyscan -t rsa n$n; done >> ~/.ssh/known_hosts
-```
-
-And check that you can SSH to the nodes
+Insist that NetworkManager use dnsmasq, *not* the public DNS. Get the long UUID
+here from `nmcli con`.
 
 ```sh
-cssh n1 n2 n3 n4 n5
+sudo nmcli con mod d41034c4-48d0-3867-922c-73480603ff2e ipv4.ignore-auto-dns yes
+sudo nmcli con mod d41034c4-48d0-3867-922c-73480603ff2e ipv4.dns "10.0.3.1"
 ```
 
-And that should mostly do it, I think.
+Restart networking so that takes effect, and/or bounce the interface
 
-## Ubuntu 14.04 / trusty
-
-Follow generally the same steps as for Debian, but the process is easier. Reference: https://help.ubuntu.com/lts/serverguide/lxc.html
-
-* Right after you have installed LXC, create or open /etc/lxc/dnsmasq.conf and add the following contents:
-
-```
-dhcp-host=n1,10.0.3.101
-dhcp-host=n2,10.0.3.102
-dhcp-host=n3,10.0.3.103
-dhcp-host=n4,10.0.3.104
-dhcp-host=n5,10.0.3.105
+```sh
+sudo systemctl restart NetworkManager
+sudo nmcli con down d41034c4-48d0-3867-922c-73480603ff2e
+sudo nmcli con up d41034c4-48d0-3867-922c-73480603ff2e
 ```
 
-10.0.3.* is LXC's default network. If you want others, go for it but you'll have to change it in the main configuration for lxc as well.
+At this juncture `cat /etc/resolv.conf` should show only 10.0.3.1, the local
+dnsmasq. Dig `google.com` should still resolve using your upstream resolver.
 
-* you may not need to add cgroup to fstab and/or mount it. /sys/fs/cgroups may already be there.
-* Then, go and run the lxc-create command, but...
-* no need to edit /var/lib/lxc/*/config or set up a bridge, LXC does that for you.
-* Fire up the boxes (lxc-start -n n{1,2,3,4,5} -d) and you should be able to ssh right into them.
-* Follow the rest of the Debian tutorial, but make sure to use the correct ip addresses.
+Set up resolved to reference the nodes. Check your interface name and address
+in `ip addr`; they may vary. This miiiight be optional with the above nmcli
+settings.
+
+```sh
+sudo bash -c "cat >/etc/systemd/system/lxc-dns-lxcbr0.service <<EOF
+[Unit]
+Description=LXC DNS configuration for lxcbr0
+After=lxc-net.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/resolvectl dns lxcbr0 10.0.3.1
+ExecStart=/usr/bin/resolvectl domain lxcbr0 '~lxc'
+ExecStopPost=/usr/bin/resolvectl revert lxcbr0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=lxc-net.service
+EOF"
+sudo systemctl daemon-reload
+sudo systemctl enable lxc-dns-lxcbr0.service
+sudo systemctl start lxc-dns-lxcbr0.service
+```
+
+Start nodes
+
+```sh
+for i in {1..10}; do
+  sudo lxc-start -d -n n$i
+done
+```
+
+[This](https://thelinuxcode.com/how-to-configure-dns-on-linux-2026-systemd-resolved-networkmanager-resolvconf-and-bind/)
+is a helpful guide to fixing resolv.conf/resolved/dnsmasq/NetworkManager
+issues. You may need to fully restart too.
+
+Copy your SSH key to nodes and set their passwords to something trivial
+
+```sh
+export YOUR_SSH_KEY=~/.ssh/id_rsa.pub
+for i in {1..10}; do
+  sudo mkdir -p /var/lib/lxc/n${i}/rootfs/root/.ssh &&
+  sudo chmod 700 /var/lib/lxc/n${i}/rootfs/root/.ssh/ &&
+  sudo cp $YOUR_SSH_KEY /var/lib/lxc/n${i}/rootfs/root/.ssh/authorized_keys &&
+  sudo chmod 644 /var/lib/lxc/n${i}/rootfs/root/.ssh/authorized_keys &&
+
+  ## Set root password
+  sudo lxc-attach -n n${i} -- bash -c 'echo -e "root\nroot\n" | passwd root';
+  sudo lxc-attach -n n${i} -- sed -i 's,^#\?PermitRootLogin .*,PermitRootLogin yes,g' /etc/ssh/sshd_config;
+  sudo lxc-attach -n n${i} -- systemctl restart sshd;
+done
+```
+
+Install sudo on nodes; this is a base Jepsen dependency
+
+```sh
+for i in {1..10}; do
+  sudo lxc-attach -n n${i} -- apt install -y sudo
+done
+```
+
+Scan node SSH keys (as whatever user you'll run Jepsen as)
+
+```sh
+for n in {1..10}; do
+  ssh-keyscan -t rsa n$n &&
+  ssh-keyscan -t ed25519 n$n
+done >> ~/.ssh/known_hosts
+```
+
+At this point you should be able to `ssh n1` without a password.
+
+----
+
+## Debian 13/trixie - Incus
+
+Due to Canonical's re-licensing and imposing of a CLA, the last version of Debian to include LXD will be trixie. Users are encouraged to migrate to Incus after upgrading from bookworm to trixie.
+
+### Install Host Packages
+
+```bash
+sudo apt update && sudo apt install incus systemd-resolved
+```
+
+### Initialize Incus
+
+```bash
+# add yourself to the incus-admin group to avoid having to be root or sudo
+# you will need to logout/login for new group to be active
+sudo adduser $USER incus-admin
+
+# initialize Incus with default config, defaults are usually OK
+incus admin init --minimal
+
+# try creating a sample container if you want
+incus launch images:debian/13 scratch
+incus list
+incus shell scratch
+incus stop scratch
+incus delete scratch
+```
+
+### Create and Start Jepsen's Node Containers
+
+```bash
+for i in {1..10}; do
+  incus launch images:debian/13 n${i};
+done
+```
+
+### Confirm Incus' Bridge Network
+
+`incus init` automatically created the bridge network, and `incus launch` automatically configured the containers for it:
+
+```bash
+incus network list
++----------+----------+---------+----------------+---+-------------+---------+---------+
+|  NAME    |   TYPE   | MANAGED |      IPV4      |...| DESCRIPTION | USED BY |  STATE  |
++----------+----------+---------+----------------+---+-------------+---------+---------+
+| incusbr0 | bridge   | YES     | 10.242.68.1/24 |...|             | 11      | CREATED |
++----------+----------+---------+----------------+---+-------------+---------+---------+
+
+# confirm your settings
+incus network get incusbr0 ipv4.address
+incus network get incusbr0 ipv6.address
+incus network get incusbr0 dns.domain    # will be blank if default incus config is used 
+
+# confirm containers are reachable
+ping n1
+PING n1 (10.242.68.40) 56(84) bytes of data.
+64 bytes from n1 (10.242.68.40): icmp_seq=1 ttl=64 time=0.030 ms
+...
+```
+
+If you want to install and run Docker, it will mess up your networking and firewall.  If your Incus containers are not reachable from the host, or the outside world is not reachable from within a container, see the Incus documentation:
+
+- [Prevent connectivity issues with Incus and Docker](https://linuxcontainers.org/incus/docs/main/howto/network_bridge_firewalld/#prevent-connectivity-issues-with-incus-and-docker)
+
+The simplest way to resolve most of Docker's impact is to create /`etc/docker/daemon.json`:
+
+```json
+{
+  "ip-forward-no-drop": true
+}
+```
+
+#### Add Required Packages to Node Containers
+
+```bash
+for i in {1..10}; do
+  incus exec n${i} -- sh -c "apt-get -qy update && apt-get -qy install openssh-server sudo";
+done
+```
+
+#### Configure SSH
+
+Slip your preferred SSH key into each node's `.ssh/.authorized-keys`:
+
+```bash
+for i in {1..10}; do
+  incus exec n${i} -- sh -c "mkdir -p /root/.ssh && chmod 700 /root/.ssh/";
+  incus file push ~/.ssh/id_rsa.pub n${i}/root/.ssh/authorized_keys --uid 0 --gid 0 --mode 644;
+done
+```
+
+Reset the root password to root, and allow root logins with passwords on each container.
+If you've got an SSH agent set up, Jepsen can use that instead.
+
+```bash
+for i in {1..10}; do
+  incus exec n${i} -- bash -c 'echo -e "root\nroot\n" | passwd root';
+  incus exec n${i} -- sed -i 's,^#\?PermitRootLogin .*,PermitRootLogin yes,g' /etc/ssh/sshd_config;
+  incus exec n${i} -- systemctl restart sshd;
+done
+```
+
+Store the node keys unencrypted so that jsch can use them.
+If you already have the node keys, they may be unreadable to Jepsen -- remove them from `~/.ssh/known_hosts` and rescan:
+
+```bash
+for n in {1..10}; do
+  ssh-keyscan -t rsa n${n} >> ~/.ssh/known_hosts;
+done
+```
+
+#### Confirm You Can `ssh` Into Nodes
+
+```bash
+ssh root@n1
+```
+
+#### Stopping and Deleting Containers
+
+```bash
+for i in {1..10}; do
+  incus stop n${i} --force;
+  incus delete n${i} --force;
+done
+```
+
+----
+
+#### Real VMs w/Real Clocks
+
+```bash
+# VM's use QEMU
+sudo apt update && sudo apt install qemu-system
+
+# note --vm flag
+incus launch images:debian/13 n1 --vm
+```
+
+Allows the clock nemesis to bump, skew, and scramble time in a Jepsen node as it's a real vm with a real clock.
+
+----
+
+#### Misc
+
+The `incus` command's \<Tab\> completion works well, even autocompletes container names.
