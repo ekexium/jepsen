@@ -1,8 +1,9 @@
 # Jepsen 0.3.14 integration
 
 This branch merges upstream Jepsen `v0.3.14` (`e5c458ad`) into PingCAP's
-`testing_ci` at `b778e6ff`, preserving both histories. Its integration and
-compatibility changes reproduce the locally validated rebase at `2de6277a`.
+`testing_ci` at `b778e6ff`, preserving both histories. The initial integration and
+compatibility changes reproduce the locally validated rebase at `2de6277a`;
+subsequent corrections are scoped separately below.
 The framework retains the `org.clojars.pingcap/jepsen` coordinate, now at
 `0.3.14-SNAPSHOT`, and uses Elle 0.2.7; build it locally as shown below.
 
@@ -82,6 +83,27 @@ in the checker, as it was at the fork head.
   subclasses; timeouts and unknown outcomes remain uncertain.
 - Multitable bank diagnostics run in the checker with the completed history;
   client teardown can run before setup in the new framework.
+
+## Scope of subsequent corrections
+
+Two inherited framework issues are isolated in their own commits:
+
+- Final reads include the inclusive maximum key and an incomplete last batch.
+  The correction changes only the range endpoint and partition operation.
+- File output checks returned byte counts at runtime and throws `IOException`
+  on an incomplete write, including when JVM assertions are disabled. Slice
+  writes compare against the requested length. Each call still performs one
+  channel write; successful offset/CRC updates and the file format are retained.
+  A failure may leave partial bytes, so the enclosing block must be abandoned.
+  This is not a new retry or recovery policy, and does not guarantee immediate
+  termination of asynchronous history writers.
+
+TiDB compatibility remains in the adapter. Upstream documents the legacy
+`causal-reverse` workload as replaced by `cycle`; its independent checker does
+not require globally unique IDs. The TiDB comments generator repeats reads and
+allocates disjoint ID ranges for the existing SQL primary-key schema, while
+reusing the upstream checker. Null JDBC messages retain their original exception
+through existing outcome classification.
 
 ## Validation
 
