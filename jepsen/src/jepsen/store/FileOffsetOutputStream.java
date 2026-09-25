@@ -9,6 +9,8 @@ import java.util.zip.CRC32;
 // This class provides an OutputStream linked to a FileChannel at a particular
 // offset; each write to this stream is written to the corresponding file. Also
 // tracks the count and CRC32 of all streamed bytes.
+// A failed write may leave partial data in the file; abort the enclosing block
+// rather than continuing to use this stream.
 public class FileOffsetOutputStream extends OutputStream implements AutoCloseable {
   public final FileChannel file;
   public final long offset;
@@ -49,7 +51,9 @@ public class FileOffsetOutputStream extends OutputStream implements AutoCloseabl
     // Write buffer and advance
     singleByteBuffer.rewind();
     final int written = file.write(singleByteBuffer, currentOffset);
-    assert written == 1;
+    if (written != 1) {
+      throw new IOException("Incomplete file write: expected 1 byte, wrote " + written);
+    }
     currentOffset += written;
     checksum.update(b);
   }
@@ -58,7 +62,9 @@ public class FileOffsetOutputStream extends OutputStream implements AutoCloseabl
     //System.out.printf("Wrote fast %d", bs.length);
     final ByteBuffer buf = ByteBuffer.wrap(bs);
     final int written = file.write(buf, currentOffset);
-    assert written == buf.limit();
+    if (written != bs.length) {
+      throw new IOException("Incomplete file write: expected " + bs.length + " bytes, wrote " + written);
+    }
     currentOffset += written;
     checksum.update(bs);
   }
@@ -67,7 +73,9 @@ public class FileOffsetOutputStream extends OutputStream implements AutoCloseabl
     //System.out.printf("Wrote fast %d", len);
     final ByteBuffer buf = ByteBuffer.wrap(bs, offset, len);
     final int written = file.write(buf, currentOffset);
-    assert written == buf.limit();
+    if (written != len) {
+      throw new IOException("Incomplete file write: expected " + len + " bytes, wrote " + written);
+    }
     currentOffset += written;
     checksum.update(bs, offset, len);
   }
