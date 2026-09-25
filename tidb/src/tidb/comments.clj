@@ -88,8 +88,24 @@
   (close! [this test]
     (c/close! conn)))
 
+(defn generator
+  "Preserves TiDB's read coverage and globally unique SQL primary keys."
+  [opts]
+  (let [limit (:per-key-limit opts 500)]
+    (independent/concurrent-generator
+      (count (:nodes opts))
+      (range)
+      (fn [k]
+        ; Each key emits at most limit operations, hence at most limit writes.
+        ; The independent checker allows per-key IDs; our SQL schema does not.
+        (let [writes (map cr/w (range (* k limit) (* (inc k) limit)))]
+          (->> (gen/mix [(gen/repeat (cr/r)) writes])
+               (gen/stagger 1/100)
+               (gen/limit limit)))))))
+
 (defn workload
   [opts]
   (assoc (cr/workload opts)
-         :name   "comments"
-         :client (CommentsClient. 10 (atom false) nil)))
+         :name      "comments"
+         :generator (generator opts)
+         :client    (CommentsClient. 10 (atom false) nil)))
